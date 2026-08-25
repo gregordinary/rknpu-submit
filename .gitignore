@@ -1,0 +1,23 @@
+# Build output
+build*/
+*-build/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# CMake in-source artifacts (configure uses -B build, but guard anyway)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# Tooling
+compile_commands.json
+.cache/
+.vscode/
+.idea/
