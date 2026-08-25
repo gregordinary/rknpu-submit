@@ -353,16 +353,20 @@ display subsystem, which is why the node is found by DRM driver name.
 Read `GET_DRV_VERSION` and gate on it before relying on the field decode described above:
 the driver versions independently of the kernel it ships in.
 
-`ctest` in the build directory runs one gate, `provider_seam`, which needs no hardware: it
-asks the driver tree what the submit seam is and checks this provider defines all of it. A
-seam that grows breaks nothing here at compile time — a provider defines those symbols
-rather than calling them — so without the gate the first sign is an undefined reference in
-whoever links the two together. The gate registers only against a `librocketnpu` source
-checkout, since the seam is read from a file an installed package does not ship.
+`ctest` in the *provider's* build directory — `build-rknpu` above, not the driver's `build`,
+whose suite is the hardware gate of step 4 — runs one gate, `provider_seam`, which needs no
+hardware: it asks the driver tree what the submit seam is and checks this provider defines all
+of it. A seam that grows breaks nothing here at compile time — a provider defines those
+symbols rather than calling them — so without the gate the first sign is an undefined
+reference in whoever links the two together. The gate registers only against a
+`librocketnpu` source checkout, since the seam is read from a file an installed package does
+not ship.
 
-The end-to-end path was followed on that board from the published repositories alone, with
-`whisper.cpp` v1.9.3: the provider, `librocketnpu` and `libggml-rocket.so` built in the order
-above, and stock `whisper-cli` selecting the `ROCKET` backend and offloading to it.
+The end-to-end path was walked on that board at these commits, from fresh clones of the three
+repositories and following the steps above as written, with `whisper.cpp` at master
+(`v1.9.3-75-g9781133`): the provider, `librocketnpu` and `libggml-rocket.so` each built with no
+errors, and stock `whisper-cli` printing all three lines of step 8 — the backend loaded, the
+backend selected, and the profile line that says work reached the device.
 
 ## Licence
 
