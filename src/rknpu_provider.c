@@ -157,10 +157,20 @@ static unsigned long ioc(const struct rknpu_dev *d, unsigned nr, size_t sz)
  * thread-safe to READ meaningfully, which is a statement about the value being a
  * moving target, not a licence to race the increments themselves. */
 static _Atomic uint64_t g_ioctls, g_tasks;
-static void count_submit(uint32_t n)
+/* Summed device time, for the sweeps that have more than one kick. The per-fd
+ * last_hw_elapse_ns below is overwritten by every submit, so a tiled or multicore
+ * matmul reports only its final one; this pair is what a multi-submit shape needs.
+ * A job the driver never committed writes back 0 (hw_commit_time == 0), which is not
+ * a zero-length submit -- those are excluded from both sums rather than counted. */
+static _Atomic uint64_t g_hw_ns, g_hw_submits;
+static void count_submit(uint32_t n, int64_t hw_ns)
 {
     atomic_fetch_add_explicit(&g_ioctls, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_tasks, n, memory_order_relaxed);
+    if (hw_ns > 0) {
+        atomic_fetch_add_explicit(&g_hw_ns, (uint64_t)hw_ns, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_hw_submits, 1, memory_order_relaxed);
+    }
 }
 
 uint64_t rocket_submit_ioctl_count(void)
@@ -171,25 +181,36 @@ void rocket_submit_counters_reset(void)
 {
     atomic_store_explicit(&g_ioctls, 0, memory_order_relaxed);
     atomic_store_explicit(&g_tasks, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_hw_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_hw_submits, 0, memory_order_relaxed);
 }
 
 /* ============================================================================
  * SECTION — BO primitives (private; the seam's rocket_bo_* wrap these)
  * ==========================================================================*/
 
-/* RKNPU_IOVA_TIGHT=0 restores the kernel's generic IOVA mapping path, which rounds
- * every BO up to a power of two and aligns it there (see
- * RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT in rknpu_uapi.h). ON by default: the rounding
- * wastes about 1.6x across a prefill's working set, against a window of only ~1.3 GiB.
+/* RKNPU_IOVA_TIGHT=0 restores the kernel's generic IOVA mapping path (see
+ * RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT in rknpu_uapi.h). ON by default, because the
+ * generic path LEAKS the shared IOMMU domain and this one does not.
  *
- * What it buys, llama.cpp pp2048 on Llama-3.2-3B F16 [HW sweep, rknpu 0.9.8]:
- * roughly 108 absorbed allocation failures per rep with it off, about 3 with it on.
- * It is a large reduction and NOT an elimination -- the window is still the binding
- * constraint and a bigger model will still exhaust it. Do not read this as fixed.
+ * What it buys, llama.cpp pp2048 on Llama-3.2-3B F16 [HW sweep, rknpu 0.9.8, 2026-08-25]:
+ * one 153 s run with the flag off costs the process-wide domain 5-11 of its 31 128 MiB
+ * buffers, permanently -- the loss outlives the process and only a reboot resets it.
+ * With the flag on the same run costs ZERO: four such arms, interleaved around the
+ * leaking ones, left all four size counts byte-identical. Throughput is the same either
+ * way (39.90-41.39 t/s across five runs), so this is headroom and not speed.
+ *
+ * Do NOT explain the flag by allocation size. The generic path's power-of-two rounding
+ * applies only below 128 KiB on kernels >= 6.1 (IOVA_RANGE_CACHE_MAX_SIZE in iova.c), and
+ * allocating one size until refusal returns identical counts AND identical addresses on
+ * both routes at 16 / 32 / 32.03 / 48 / 64 / 128 / 192 MiB. No static probe separates
+ * them; the mechanism is unidentified and lives in the real workload's allocation
+ * pattern. It is not the error path either -- all five runs reported zero kernel
+ * allocation failures on both routes.
  *
  * It needs the BO prefill below to be correct; without that it costs two gates.
- * With it, 93 of 93 twice, and no measurable cost at pp512 (interleaved arms on one
- * binary: off 56.06/55.90, on 55.72/56.37). */
+ * With it, 93 of 93 twice, and no measurable cost at pp512 (67.57 t/s in both arms over
+ * four interleaved rounds with the board to itself). */
 static uint32_t rknpu_iova_tight_flag(void)
 {
     static _Atomic int cached = -1;
@@ -760,7 +781,7 @@ static int submit_locked(struct rknpu_dev *d, const rocket_task_desc *tasks,
         return -e;
     }
     d->last_hw_elapse_ns = s.hw_elapse_time;
-    count_submit(n_prog);
+    count_submit(n_prog, s.hw_elapse_time);
     return 0;
 }
 
@@ -890,6 +911,13 @@ int64_t rknpu_last_hw_elapse_ns(int fd)
 {
     struct rknpu_dev *d = dev_find(fd);
     return d ? d->last_hw_elapse_ns : -1;
+}
+
+uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits)
+{
+    if (n_submits)
+        *n_submits = atomic_load_explicit(&g_hw_submits, memory_order_relaxed);
+    return atomic_load_explicit(&g_hw_ns, memory_order_relaxed);
 }
 
 int rknpu_action(int fd, uint32_t action, uint32_t *value)

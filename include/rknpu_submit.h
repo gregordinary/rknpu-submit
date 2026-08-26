@@ -42,6 +42,29 @@ extern "C" {
  * immediately after the submit whose time you want. */
 int64_t rknpu_last_hw_elapse_ns(int fd);
 
+/* Summed hardware elapsed time over every submit this PROCESS has made since the last
+ * rocket_submit_counters_reset(), in nanoseconds; *n_submits receives how many submits
+ * contributed. This is what a tiled or multicore shape needs — the per-fd value above is
+ * overwritten by each submit, so it reports only the last kick of a many-kick matmul.
+ *
+ * Read the envelope before quoting a dispatch floor from the difference between this and
+ * a wall clock [source-confirmed, rknpu_job.c]. It is a ktime PAIR, not a hardware
+ * counter: hw_commit_time is stamped where the job is pulled off the core's todo list,
+ * immediately before the register program is written, and the delta is taken in the IRQ
+ * path. So it CONTAINS the register-write burst and the interrupt latency, and EXCLUDES
+ * the ioctl entry, the BO and IOMMU setup, the fence plumbing, and every host-side cost —
+ * including the packing and de-tiling that dominate this part's wall.
+ *
+ * Two more bounds, neither of them visible from the value. On a MULTICORE job each core's
+ * completion overwrites the job's elapsed time rather than adding to it, so a three-core
+ * submit contributes one core's span and not their sum. And a job carrying more than
+ * max_submit_number tasks (4095 on RK3588) is re-committed in chunks, re-stamping
+ * hw_commit_time each time, so its contribution covers only the final chunk — inert at
+ * the task counts this library emits, and not inert if that ever changes.
+ *
+ * Submits the driver never committed write back 0 and are counted in neither sum. */
+uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits);
+
 /* Raw DRM_IOCTL_RKNPU_ACTION. `action` is one of the RKNPU_GET_ / RKNPU_SET_ numbers
  * in src/rknpu_uapi.h; *value is the input for a SET and receives the result for a GET.
  * Returns 0, or a negative errno — EINVAL is what an action this part does not

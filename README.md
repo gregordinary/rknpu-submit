@@ -166,10 +166,11 @@ and whose device never appears — a silent absence rather than an error.
 
 `ggml-rocket` builds its own copy of `librocketnpu` from `ROCKETNPU_DIR` and passes the two
 provider settings down to it, which is why they are repeated here. The build from step 3 is
-not wasted: it is the one the gate suite in step 4 exercises. If a `rocketnpu` package is
-already installed — a `cmake --install`, typically under `/usr/local` — that package is used
-and `ROCKETNPU_DIR` is ignored. The configure log distinguishes the two cases, and
-`-DCMAKE_DISABLE_FIND_PACKAGE_rocketnpu=ON` forces the source tree.
+not wasted: it is the one the gate suite in step 4 exercises. An explicit `ROCKETNPU_DIR` wins
+over an installed `rocketnpu` package — a `cmake --install`, typically under `/usr/local` —
+and the configure log says which of the two it took. Without it the installed package is
+preferred, which on a machine carrying a stale install builds the backend against a driver
+nobody named.
 
 **7. Run stock `whisper-cli`.**
 
@@ -316,6 +317,58 @@ included, which is why its core-second figures are roughly twice `whisper-cli`'s
 threads and why the ratio is not comparable to the tables above. Pinning to the big cores is
 worth more than it is here.
 
+### A third frontend: the detection delegate
+
+[`tflite-rocket`](https://github.com/gregordinary/tflite-rocket) is a TensorFlow Lite external
+delegate, and it reaches this NPU the same way for the same reason: the seam is below the
+frontend, so the delegate is a `.so` that any TFLite host loads at runtime against an unmodified
+`.tflite` model. It links `librocketnpu` directly rather than through `ggml`, so steps 1 through
+4 are unchanged and steps 5 onward become one build:
+
+```sh
+git clone https://github.com/gregordinary/tflite-rocket
+cmake -S tflite-rocket -B build-tflite-rocket \
+      -DTFLITE_DIR=/path/to/tflite-c-headers \
+      -DROCKETNPU_DIR=$PWD/rocket-userspace \
+      -DROCKETNPU_PROVIDER=external \
+      -DROCKETNPU_PROVIDER_LIB=$PWD/build-rknpu/librknpu-submit.a
+cmake --build build-tflite-rocket -j
+```
+
+`TFLITE_DIR` is a header root, not a library: the delegate is a classic C `TfLiteDelegate` and
+needs only `tensorflow/lite/core/c/{common,builtin_op_data}.h` plus
+`tensorflow/lite/builtin_ops.h`. The build also produces `libtflite_cshim.so`, which supplies
+the two TFLite C-API symbols the delegate expects to bind at `dlopen`. The classic
+`tflite_runtime` and full `tensorflow` wheels export them; LiteRT (`ai_edge_litert`, the only
+wheel on recent Python) hides them, so under LiteRT the shim must be `LD_PRELOAD`ed or the
+delegate fails to load with `undefined symbol: TfLiteIntArrayCreate`.
+
+```sh
+LD_PRELOAD=$PWD/build-tflite-rocket/libtflite_cshim.so python3 - <<'EOF'
+from ai_edge_litert.interpreter import Interpreter, load_delegate, OpResolverType
+d = load_delegate("build-tflite-rocket/libtflite_rocket.so", options={"native_int8": "1"})
+it = Interpreter(model_path="ssdlite_mobiledet_coco_qat_postprocess.tflite",
+                 experimental_delegates=[d],
+                 experimental_op_resolver_type=OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
+it.allocate_tensors(); it.invoke()
+EOF
+```
+
+The no-default-resolver type is load-bearing: without it XNNPACK claims the convolutions before
+an external delegate is offered them, and the model runs entirely on the CPU while looking
+delegated. The delegate's `profile=1` option prints the per-op line that says otherwise.
+
+Measured against the mainline `rocket` driver on the same silicon, from the same sources, with
+both boards clock-matched at 600 MHz: **the detectors' outputs are identical at the byte**. An
+MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 agrees across the two
+drivers in the CPU, `native_int8=1` and `native_int8=0` arms, with every on-NPU auxiliary route
+enabled, and on the fp16-NCHW resident path. Warm single-inference latency is 202.1 ms against
+mainline's 197.9 for MobileDet and 299.6 against 293.6 for EfficientDet-Lite0 — a 2% difference
+on a workload that is host-bound rather than device-bound, and the two boards' CPU ceilings
+differ by that much on their own. Four concurrent detection processes, the shape a
+multi-camera deployment takes, produce the single-process output hash on both drivers and
+aggregate 3.51x against mainline's 3.61x.
+
 ## Runtime configuration
 
 | Variable | Default | Effect |
@@ -323,18 +376,24 @@ worth more than it is here.
 | `ROCKET_DEV` | probe by driver name | Open a specific node, for a multi-NPU box or a test rig. |
 | `RKNPU_CORE_MASK` | `0` (driver schedules) | Pin submits to one core: `1`, `2` or `4`. Single-core values only — the driver commits the same task range to every core named. |
 | `ROCKET_BATCH_SUBMIT` | `1` (chained) | `0` issues one submit per program in the gapped layout. |
-| `RKNPU_IOVA_TIGHT` | `1` | `0` selects the kernel's generic IOVA mapping path, which rounds each mapping up to the next power of two. |
+| `RKNPU_IOVA_TIGHT` | `1` | `0` selects the kernel's generic IOVA mapping path, which permanently consumes the shared IOMMU domain. |
 | `RKNPU_BO_SENTINEL` | `0` | Fill fresh buffers with a given byte, so an all-zero readback separates "the device wrote zeros" from "the device never wrote". |
 
-`RKNPU_IOVA_TIGHT` selects `RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT`, which maps each buffer
-at its true size. On the rounding path a working set exhausts the IOVA window and the
-library absorbs the failed allocations onto the CPU: roughly 108 per repetition of a
-2048-token prefill against about 3 with tight mapping. Throughput at 512 tokens is
-unchanged either way — 67.57 tokens/s in both arms over four interleaved rounds with the
-board to itself — so the flag buys headroom rather than speed, and the window remains the
-binding constraint on a larger model. Buffers allocated on this path are prefilled and
-flushed from the CPU before first use, which establishes the mapping for the device's
-writes.
+`RKNPU_IOVA_TIGHT` selects `RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT`, and what it buys is that
+the shared IOMMU domain survives the workload. This driver maps every buffer through **one
+domain shared across the whole process**, and on the generic path a single 2048-token prefill
+(Llama-3.2-3B F16, 153 s) permanently costs that domain 5–11 of the 31 128 MiB buffers it can
+serve — a loss that outlives the process, so only a reboot resets it. With the flag set the
+same run costs **zero**, measured with four such arms interleaved around the leaking ones.
+Throughput is identical either way (39.90–41.39 tokens/s at 2048, 67.57 at 512 in both arms),
+so the flag buys headroom rather than speed.
+
+The mechanism is not identified and no static probe finds it: allocating one size until refusal
+returns identical counts *and identical addresses* on both routes at every size from 16 to
+192 MiB, and both routes complete a prefill with zero kernel allocation failures. Probe the
+domain before trusting an allocation-sensitive measurement on a board whose history you do not
+know. Buffers allocated on the tight path are prefilled and flushed from the CPU before first
+use, which establishes the mapping for the device's writes.
 
 ## Driver characteristics
 
@@ -443,6 +502,11 @@ backend selected, and the profile line that says work reached the device.
 with the two host-side workarounds its section describes: it selects the NPU as an `accel`
 device and offloads to it, and its two gaps are the frontend's own rather than this
 provider's.
+
+The TFLite delegate was built and run on the same board against the same driver build. Its
+own hardware gates pass on this provider — `convert_test` at 220 cases and 0 failures, and the six driver-level
+probes it ships, including a 1494-shape CBUF bank-slack sweep at zero error — and its detector
+outputs are byte-identical to the mainline driver's, which is the check its section reports.
 
 ## Licence
 
