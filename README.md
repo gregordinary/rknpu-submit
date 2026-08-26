@@ -149,9 +149,16 @@ cmake -S ggml-rocket -B build-ggml-rocket \
       -DGGML_LIB_DIR=$PWD/whisper.cpp/build/bin \
       -DROCKETNPU_DIR=$PWD/rocket-userspace \
       -DROCKETNPU_PROVIDER=external \
-      -DROCKETNPU_PROVIDER_LIB=$PWD/build-rknpu/librknpu-submit.a
+      -DROCKETNPU_PROVIDER_LIB=$PWD/build-rknpu/librknpu-submit.a \
+      -DROCKETNPU_DRIVER_NAME="vendor rknpu driver"
 cmake --build build-ggml-rocket -j
 ```
+
+`ROCKETNPU_DRIVER_NAME` is cosmetic and worth setting: it is what `rocket_driver_name()`
+returns, and a frontend prints it in the device listing. `librocketnpu` can name its own
+builtin driver and cannot name someone else's, so an external build that says nothing here
+reports the neutral `external submit provider` — accurate, but less use than the driver's
+name on a board where which kernel path is live is the question being asked.
 
 Against the host application's bundled `ggml`, not a separate `ggml` checkout: the backend
 vtable is positional, so a mismatched `GGML_BACKEND_API_VERSION` yields a `.so` that loads
@@ -244,6 +251,70 @@ the prompt context for every window after it.
 
 Radio and telephony audio is degraded audio. A benchmark on clean read speech will show the
 two arms agreeing exactly, and will not have tested the case that matters.
+
+### Another frontend: transcribe.cpp
+
+[`transcribe.cpp`](https://github.com/handy-computer/transcribe.cpp) (MIT) is a `ggml`-based
+multi-model speech-to-text library — Whisper, Parakeet, Canary, Granite Speech, Voxtral,
+SenseVoice and more — and it reaches this NPU through the same mechanism, because the seam
+is below the frontend and `GGML_BACKEND_PATH` is a `ggml` facility rather than a
+`whisper.cpp` one. Nothing in it knows about this provider. Steps 1 through 4 above are
+unchanged; steps 5 and 6 become:
+
+```sh
+git clone https://github.com/handy-computer/transcribe.cpp
+cmake -S transcribe.cpp -B transcribe.cpp/build \
+      -DTRANSCRIBE_BUILD_SHARED=ON -DTRANSCRIBE_GGML_BACKEND_DL=ON \
+      -DTRANSCRIBE_VULKAN=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+cmake --build transcribe.cpp/build -j
+
+cmake -S ggml-rocket -B build-gr-transcribe \
+      -DGGML_ROCKET_DL=ON \
+      -DHOST_DIR=$PWD/transcribe.cpp \
+      -DGGML_LIB_DIR=$PWD/transcribe.cpp/build/ggml/src \
+      -DROCKETNPU_DIR=$PWD/rocket-userspace \
+      -DROCKETNPU_PROVIDER=external \
+      -DROCKETNPU_PROVIDER_LIB=$PWD/build-rknpu/librknpu-submit.a \
+      -DROCKETNPU_DRIVER_NAME="vendor rknpu driver"
+cmake --build build-gr-transcribe -j
+```
+
+`GGML_CPU_ARM_ARCH` is load-bearing for the same reason as in step 5. `GGML_LIB_DIR` is this
+host's `build/ggml/src` rather than its `build/bin`; the CPU module is found separately.
+
+**Two gaps in the host's own dynamic-backend path need working around**, neither of them
+this provider's and neither reported as what it is:
+
+- The CLI registers dynamic backends only on its `--list-devices` path, so a shared build
+  loads no backend at all when it transcribes and stops with `whisper: failed to initialize
+  CPU backend`. Calling `transcribe_init_backends_default()` once before the model load in
+  `examples/cli/main.cpp` is the whole fix.
+- The backend scan reads only the directory the library itself sits in, and the Arm CPU
+  module is a plain `libggml-cpu.so` elsewhere in the build: `cp build/bin/libggml-cpu.so
+  build/src/`. Without it only the NPU registers, and the run fails as above.
+
+Then run it, with the module search path pointed at the build and the NPU supplied the same
+way:
+
+```sh
+cd transcribe.cpp
+LD_LIBRARY_PATH=$PWD/build/ggml/src:$PWD/build/bin:$PWD/build/src \
+GGML_BACKEND_PATH=../build-gr-transcribe/libggml-rocket.so ROCKET_KACC=1 \
+  ./build/bin/transcribe-cli -m <model>.gguf audio.wav
+```
+
+Its proof line is worded differently — `whisper: using accel backend: ROCKET` — and
+`ROCKET_MM_PROFILE=1` adds the same profile line, which is still the only evidence that work
+reached the device. `--list-devices` should show `kind=accel`, which is what puts the NPU
+ahead of the CPU in its scheduler.
+
+Measured on the validation board with `whisper-base.en-Q8_0` on an 11 s clip, medians of
+three interleaved runs: 1.88 s wall and 9.00 CPU core-seconds on the NPU against 2.97 s and
+21.70 on the CPU, so 1.58x wall and 58.5% of the core-seconds handed back, with the
+transcripts identical. Both arms take this CLI's default of every core, little cores
+included, which is why its core-second figures are roughly twice `whisper-cli`'s at four
+threads and why the ratio is not comparable to the tables above. Pinning to the big cores is
+worth more than it is here.
 
 ## Runtime configuration
 
@@ -367,6 +438,11 @@ repositories and following the steps above as written, with `whisper.cpp` at mas
 (`v1.9.3-75-g9781133`): the provider, `librocketnpu` and `libggml-rocket.so` each built with no
 errors, and stock `whisper-cli` printing all three lines of step 8 — the backend loaded, the
 backend selected, and the profile line that says work reached the device.
+
+`transcribe.cpp` was walked on the same board and the same day, at its commit `c6a9257`,
+with the two host-side workarounds its section describes: it selects the NPU as an `accel`
+device and offloads to it, and its two gaps are the frontend's own rather than this
+provider's.
 
 ## Licence
 
