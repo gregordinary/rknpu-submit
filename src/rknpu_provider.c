@@ -94,6 +94,7 @@ struct rknpu_bo_priv { uint32_t handle; uint64_t obj_addr; uint64_t dma_addr; si
 struct rknpu_dev {
     int  fd;             /* -1 = free slot */
     int  is_drm;         /* 1 = DRM render node ('d' magic), 0 = /dev/rknpu ('r') */
+    uint32_t drv_version;          /* RKNPU_GET_DRV_VERSION code, 0 if unreadable */
     struct rknpu_bo_priv taskbo;   /* the rknpu_task[] array, grown on demand */
     uint32_t taskbo_cap;           /* how many rknpu_task entries it holds     */
     int64_t  last_hw_elapse_ns;    /* rknpu_submit.hw_elapse_time, written back */
@@ -200,18 +201,44 @@ void rocket_submit_counters_reset(void)
  * leaking ones, left all four size counts byte-identical. Throughput is the same either
  * way (39.90-41.39 t/s across five runs), so this is headroom and not speed.
  *
- * Do NOT explain the flag by allocation size. The generic path's power-of-two rounding
- * applies only below 128 KiB on kernels >= 6.1 (IOVA_RANGE_CACHE_MAX_SIZE in iova.c), and
- * allocating one size until refusal returns identical counts AND identical addresses on
- * both routes at 16 / 32 / 32.03 / 48 / 64 / 128 / 192 MiB. No static probe separates
- * them; the mechanism is unidentified and lives in the real workload's allocation
- * pattern. It is not the error path either -- all five runs reported zero kernel
- * allocation failures on both routes.
+ * The mechanism is the kernel's IOVA rcache, and the driver reaches it by mixing two
+ * allocators on ONE domain. With the flag set the driver calls alloc_iova()/free_iova(),
+ * which are the rbtree directly; with it clear the mapping falls to the generic
+ * dma_map_sg(), hence alloc_iova_fast()/free_iova_fast(), which go through the per-CPU
+ * rcache. free_iova_fast() parks the range in a magazine or the global depot, and
+ * alloc_iova() NEVER consults the rcache -- so space freed on the generic route is
+ * unreachable to the driver's own route. The rcache belongs to the iova_domain, which
+ * here is one domain shared process-wide, which is why the loss outlives the process.
+ *
+ * iova_rcache_insert() takes only sizes up to 32 pages (128 KiB), and that bound is the
+ * proof [HW sweep, 2026-08-26, fresh domain per arm, 4400 buffers churned and every one
+ * freed]: at 128 KiB on the generic route the domain loses 34/8/4/3 of its 255/63/31/21
+ * buffers at 16/64/128/192 MiB; at 256 KiB it loses ZERO; at 132 KiB -- one page over the
+ * bound -- it loses ZERO; and at 128 KiB on the tight route it loses ZERO. The magnitude
+ * agrees three ways: 34 x 16 MiB = 544 MiB against the 540 MiB one thread can park, a
+ * second churn costs only 3 more because the cache is at its ceiling, and spreading over
+ * 8 CPUs and all six cached orders costs 10 of 31 against a real prefill's 11.
+ *
+ * That bound is also why every earlier probe read zero: they allocated 16-192 MiB, all
+ * far above 128 KiB, so none of their frees could enter the cache on either route. It is
+ * not the error path either -- all five runs reported zero kernel allocation failures on
+ * both routes.
+ *
+ * The asymmetry cuts the other way too, and it is the one caveat on this default.
+ * alloc_iova_fast() FLUSHES every online CPU's magazines and the whole depot when it
+ * cannot satisfy a request, and retries -- so the generic route can always clean up after
+ * itself, and one generic allocate-to-refusal repairs a degraded domain outright (27 ->
+ * 31 128 MiB buffers, and a tight measurement after it also reads 31; measured
+ * 2026-08-26). alloc_iova() has no such path and the flush helpers are static to iova.c,
+ * so THIS route cannot drain the cache at any size. We never fill it, so we never need
+ * to -- but on a board also running stock RKNN userspace, which takes the leaking route,
+ * this is the process that pays: it sees -ENOMEM while the space sits in a cache it has
+ * no way to reach. A large refusal here stays worth retrying smaller.
  *
  * It needs the BO prefill below to be correct; without that it costs two gates.
  * With it, 93 of 93 twice, and no measurable cost at pp512 (67.57 t/s in both arms over
  * four interleaved rounds with the board to itself). */
-static uint32_t rknpu_iova_tight_flag(void)
+static uint32_t rknpu_iova_tight_flag(const struct rknpu_dev *d)
 {
     static _Atomic int cached = -1;
     int v = cached;
@@ -221,6 +248,10 @@ static uint32_t rknpu_iova_tight_flag(void)
                                             : (int)RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;
         cached = v;
     }
+    /* The bit arrived in 0.9.7. An older driver accepts it and ignores it, so setting
+     * it there would read as protection the domain is not getting; rocket_open() has
+     * already said so once. */
+    if (d && d->drv_version && d->drv_version < RKNPU_DRV_VERSION_IOVA_TIGHT) return 0;
     return (uint32_t)v;
 }
 
@@ -237,10 +268,18 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
     /* NON_CONTIGUOUS deliberately — see the note in rknpu_uapi.h. A contiguous
      * request becomes unmappable once CMA runs short, silently and only under load. */
     c.flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU |
-              RKNPU_MEM_ZEROING | rknpu_iova_tight_flag() | extra;
+              RKNPU_MEM_ZEROING | rknpu_iova_tight_flag(d) | extra;
     if (ioctl(d->fd, ioc(d, RKNPU_MEM_CREATE_NR, sizeof c), &c) < 0) {
         int e = errno;
         RKNPU_LOGE("MEM_CREATE(%zu): %s\n", mapped, strerror(e));
+        /* The request word carries sizeof(struct rknpu_mem_create), so a driver whose
+         * structure is the pre-0.9.6 40-byte one rejects the command itself. That is
+         * what ENOTTY means here, and it is the shape the failure takes when the version
+         * read at open returned nothing. */
+        if ((e == ENOTTY || e == EINVAL) && !d->drv_version)
+            RKNPU_LOGE("  the request word carries sizeof(rknpu_mem_create)=%zu, which "
+                       "rknpu 0.9.6 and later expect. A 0.9.5-or-older driver rejects "
+                       "it; this provider's floor is 0.9.6.\n", sizeof c);
         return -e;
     }
     memset(&m, 0, sizeof m);
@@ -278,7 +317,7 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
     {
         const char *e = getenv("RKNPU_BO_SENTINEL");
         int fill = e && *e ? (int)(strtoul(e, NULL, 0) & 0xff) : 0;
-        if (e || rknpu_iova_tight_flag()) {
+        if (e || rknpu_iova_tight_flag(d)) {
             memset(p, fill, mapped);
             struct rknpu_mem_sync sy;
             memset(&sy, 0, sizeof sy);
@@ -327,6 +366,12 @@ static int bo_sync(struct rknpu_dev *d, uint64_t obj_addr, uint64_t off, uint64_
  * SECTION — Device open / close
  * ==========================================================================*/
 
+/* DRM render minors start at 128; the range is wide enough for every render node a
+ * Rockchip board presents, and the failure message quotes it, so a board outside it
+ * is visible rather than silent. */
+#define RKNPU_RENDER_FIRST 128
+#define RKNPU_RENDER_LAST  143
+
 /* Probe by DRM DRIVER NAME, never by node number. On the boards this was written
  * against the NPU is renderD129 and renderD128 is the display subsystem; that
  * ordering is a property of probe order and must not be assumed. ROCKET_DEV forces a
@@ -353,25 +398,98 @@ static int open_node(struct rknpu_dev *d)
         return 0;
     }
 
-    for (int n = 128; n < 144; n++) {
+    /* What each node turned out to be, kept only to explain a failure. A node the
+     * scan could not OPEN is not a node it has ruled out, and reporting both as
+     * "not found" is what sends a reader to their device tree when the answer was
+     * group membership. */
+    struct { int minor; int err; char name[64]; }
+        seen[RKNPU_RENDER_LAST - RKNPU_RENDER_FIRST + 1];
+    int nseen = 0, ndenied = 0;
+
+    for (int n = RKNPU_RENDER_FIRST; n <= RKNPU_RENDER_LAST; n++) {
         char p[64];
         struct rknpu_drm_version v;
         snprintf(p, sizeof p, "/dev/dri/renderD%d", n);
         int fd = open(p, O_RDWR | O_CLOEXEC);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            /* An absent node is the normal case and says nothing; a node that is
+             * present and refuses is the whole diagnosis. */
+            if (errno != ENOENT && errno != ENXIO) {
+                if (errno == EACCES || errno == EPERM) ndenied++;
+                seen[nseen].minor = n; seen[nseen].err = errno;
+                seen[nseen].name[0] = '\0';
+                nseen++;
+            }
+            continue;
+        }
         memset(&v, 0, sizeof v); memset(namebuf, 0, sizeof namebuf);
         v.name_len = sizeof namebuf - 1; v.name = namebuf;
         if (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) == 0 && strcmp(namebuf, "rknpu") == 0) {
             d->fd = fd; d->is_drm = 1;
             return 0;
         }
+        seen[nseen].minor = n; seen[nseen].err = 0;
+        snprintf(seen[nseen].name, sizeof seen[nseen].name, "%s", namebuf);
+        nseen++;
         close(fd);
     }
     int fd = open("/dev/rknpu", O_RDWR | O_CLOEXEC);
     if (fd >= 0) { d->fd = fd; d->is_drm = 0; return 0; }
-    RKNPU_LOGE("no rknpu device found (no /dev/dri/renderD12x answers to 'rknpu', "
-               "no /dev/rknpu)\n");
+    int misc_err = errno;
+    if (misc_err == EACCES || misc_err == EPERM) ndenied++;
+
+    RKNPU_LOGE("no rknpu device found. What the scan saw:\n");
+    for (int i = 0; i < nseen; i++) {
+        if (seen[i].err)
+            RKNPU_LOGE("  /dev/dri/renderD%d: %s\n", seen[i].minor, strerror(seen[i].err));
+        else if (seen[i].name[0])
+            RKNPU_LOGE("  /dev/dri/renderD%d: DRM driver '%s'\n",
+                       seen[i].minor, seen[i].name);
+        else
+            RKNPU_LOGE("  /dev/dri/renderD%d: answers no DRM VERSION\n", seen[i].minor);
+    }
+    if (nseen == 0)
+        RKNPU_LOGE("  /dev/dri/renderD%d..%d: no node present\n",
+                   RKNPU_RENDER_FIRST, RKNPU_RENDER_LAST);
+    RKNPU_LOGE("  /dev/rknpu: %s\n", strerror(misc_err));
+    if (ndenied)
+        RKNPU_LOGE("%d node(s) refused this process. A node that cannot be opened has "
+                   "not been ruled out: re-run under `sudo -E`, or join the group that "
+                   "owns /dev/dri/renderD* (usually `render`).\n", ndenied);
+    else
+        RKNPU_LOGE("Every node above was readable and none is 'rknpu'. Check that the "
+                   "driver bound: `sudo dmesg | grep -i rknpu` prints \"Initialized "
+                   "rknpu\" when it did, and `ls -l /sys/class/drm/renderD*/device/driver` "
+                   "names the driver behind each node. ROCKET_DEV=<path> forces one.\n");
     return -ENODEV;
+}
+
+/* The driver's own version, read before anything depends on a structure layout.
+ * `rknpu_action` is 8 bytes in every released version, so this call is answered even by
+ * a driver whose memory structures this provider cannot speak. 0 means the read failed,
+ * which is treated as "assume current": a working board keeps working, and the
+ * MEM_CREATE failure below still names the floor. */
+static uint32_t read_drv_version(const struct rknpu_dev *d)
+{
+    struct rknpu_action a;
+    memset(&a, 0, sizeof a);
+    a.flags = RKNPU_GET_DRV_VERSION;
+    if (ioctl(d->fd, ioc(d, RKNPU_ACTION_NR, sizeof a), &a) < 0) {
+        RKNPU_LOGE("GET_DRV_VERSION: %s; proceeding as if the driver were current\n",
+                   strerror(errno));
+        return 0;
+    }
+    return a.value;
+}
+
+static void version_notes(uint32_t v)
+{
+    if (!v || v >= RKNPU_DRV_VERSION_IOVA_TIGHT) return;
+    RKNPU_LOGE("rknpu %u.%u.%u predates RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT (0.9.7), "
+               "so RKNPU_IOVA_TIGHT is unavailable and every buffer takes the kernel's "
+               "generic IOVA path. That path permanently consumes the shared IOMMU "
+               "domain, and only a reboot returns it.\n",
+               v / 10000, (v % 10000) / 100, v % 100);
 }
 
 int rocket_open(void)
@@ -382,6 +500,19 @@ int rocket_open(void)
 
     int rc = open_node(&tmp);
     if (rc < 0) return rc;
+
+    tmp.drv_version = read_drv_version(&tmp);
+    if (tmp.drv_version && tmp.drv_version < RKNPU_DRV_VERSION_MIN) {
+        RKNPU_LOGE("rknpu %u.%u.%u is below this provider's floor of 0.9.6. Its "
+                   "`rknpu_mem_create` is 40 bytes where 0.9.6 and later make it 48, and "
+                   "the ioctl request word encodes that size, so buffer allocation would "
+                   "fail on every call. Refusing at open instead.\n",
+                   tmp.drv_version / 10000, (tmp.drv_version % 10000) / 100,
+                   tmp.drv_version % 100);
+        close(tmp.fd);
+        return -ENOTSUP;
+    }
+    version_notes(tmp.drv_version);
 
     struct rknpu_dev *slot = dev_slot(tmp.fd, 1);
     if (!slot) {

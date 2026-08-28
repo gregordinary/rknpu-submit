@@ -169,6 +169,28 @@ _Static_assert(sizeof(struct rknpu_submit)      == 104, "rknpu_submit layout");
 #define RKNPU_CORE1_MASK   0x02u
 #define RKNPU_CORE2_MASK   0x04u
 
+/* ---- driver version ---------------------------------------------------------
+ *
+ * RKNPU_GET_DRV_VERSION returns MAJOR*10000 + MINOR*100 + PATCHLEVEL, so 0.9.8 reads
+ * 908. The structures below are 0.9.6's, which 0.9.7 and 0.9.8 carry unchanged, and
+ * two thresholds bound where they apply.
+ *
+ * 0.9.6 (2024-03-18) grew `rknpu_mem_create` from 40 to 48 bytes by appending
+ * `iommu_domain_id` and its padding, and it re-purposed `rknpu_submit`'s 64-bit
+ * `regcfg_obj_addr` into `iommu_domain_id` plus padding. The size change is the hard
+ * boundary: the ioctl request word encodes the structure size, so a 0.9.5-or-older
+ * driver does not recognize MEM_CREATE at all and the first allocation fails. Every
+ * other structure holds its size from 0.8.0 through 0.9.8.
+ *
+ * 0.9.7 (2024-04-24) added RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT. The driver never
+ * checks flags against RKNPU_MEM_MASK, so an older one accepts the bit and ignores it:
+ * the allocation takes the leaking generic route while the flag reads as set. The
+ * provider withholds the bit below this version and says so once.
+ */
+#define RKNPU_DRV_VERSION_CODE(maj, min, patch) ((maj) * 10000 + (min) * 100 + (patch))
+#define RKNPU_DRV_VERSION_MIN         RKNPU_DRV_VERSION_CODE(0, 9, 6)
+#define RKNPU_DRV_VERSION_IOVA_TIGHT  RKNPU_DRV_VERSION_CODE(0, 9, 7)
+
 /* ---- actions (DRM_IOCTL_RKNPU_ACTION) -------------------------------------- */
 #define RKNPU_GET_HW_VERSION        0
 #define RKNPU_GET_DRV_VERSION       1
