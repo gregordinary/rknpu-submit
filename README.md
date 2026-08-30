@@ -5,7 +5,7 @@ that drives the Rockchip NPU through the vendor `rknpu` BSP kernel driver.
 
 `librocketnpu` drives the mainline `accel/rocket` device. Most Rockchip distributions
 ship the BSP kernel instead, where the NPU is an `rknpu` DRM render node or the misc
-`/dev/rknpu`. This provider targets that driver's GPL ioctl surface, which accepts the
+`/dev/rknpu`. This provider targets that driver's GPL ioctl surface. It accepts the
 same CNA→CORE→DPU register programs `librocketnpu` already emits, and so brings those
 systems into the open stack. It opens either node flavor, discovering which the kernel
 presents.
@@ -29,7 +29,7 @@ the CMake package declares `SameMinorVersion` compatibility, and a consumer that
 ## Requirements
 
 - A Rockchip SoC running a BSP kernel with `rknpu` 0.9.6 or later loaded. Validated on
-  RK3588 with 0.9.8; see [Validation](#validation).
+  RK3588 with 0.9.8, in [Validation](#validation).
 - Read and write access to the NPU device node. A DRM render node is conventionally
   `root:render` mode `0660`.
 - CMake 3.16 or later and a C11 compiler.
@@ -121,9 +121,9 @@ cd build && ctest --output-on-failure -j1 --timeout 300
 ```
 
 This is the first step that touches the hardware, so it needs the device access from
-[Requirements](#requirements). Run the suite serially: the driver shares one IOMMU domain
+[Requirements](#requirements). Run the suite serially. The driver shares one IOMMU domain
 process-wide, so concurrent jobs compete for the same window. After changing the provider,
-rebuild the whole consumer tree; a provider-only rebuild leaves the suite's executables
+rebuild the whole consumer tree. A provider-only rebuild leaves the suite's executables
 linked against the previous archive.
 
 ### When no device is found
@@ -165,8 +165,8 @@ The three commands above report the device itself.
 ### When an allocation is refused
 
 A gate failure that names an allocation is the shared IOVA window rather than a wrong
-answer. The driver maps every buffer into one window shared across the whole process tree,
-and the suite's largest shapes ask for single buffers of a hundred megabytes and more.
+answer. The driver maps every buffer into one window shared across the whole process tree.
+The suite's largest shapes ask for single buffers of a hundred megabytes and more.
 
 Confirm it:
 
@@ -176,8 +176,8 @@ sudo dmesg | grep -i iova
 
 A reboot is the driver's only reset for the window. The same shape generally passes at
 multi-worker fan-out, which splits the buffer into pieces the window can still serve. Keep
-`RKNPU_IOVA_TIGHT` at its default of `1`, which is what stops a workload consuming the
-window permanently; see [Runtime configuration](#runtime-configuration).
+`RKNPU_IOVA_TIGHT` at its default of `1`. That is what stops a workload consuming the
+window permanently, and [Runtime configuration](#runtime-configuration) has the detail.
 
 <details>
 <summary>How fast the window degrades</summary>
@@ -188,7 +188,7 @@ size from 16 MB to 256 MB. The same board a day later served 35 buffers of 16 MB
 128 MB and none of 192 MB.
 
 `librocketnpu` treats such a refusal as transient where it can, retrying a smaller
-allocation before giving up, so the usual effect is a slower path than a failed one.
+allocation before giving up. The usual effect is a slower path rather than a failed one.
 
 </details>
 
@@ -239,15 +239,15 @@ cmake --build build-ggml-rocket -j
 
 `HOST_DIR` and `GGML_LIB_DIR` point at the host application's own bundled `ggml`. The
 backend vtable is positional, so a matching `GGML_BACKEND_API_VERSION` is what makes the
-device appear; a `.so` built against a different `ggml` checkout loads cleanly and
-registers no device.
+device appear. A `.so` built against a different `ggml` checkout loads cleanly and registers
+no device.
 
-`ROCKETNPU_DRIVER_NAME` is cosmetic and worth setting: it is what a frontend prints in its
+`ROCKETNPU_DRIVER_NAME` is cosmetic and worth setting. It is what a frontend prints in its
 device listing, and it names which kernel path is live. Left unset, an external build
 reports `external submit provider`.
 
 `ggml-rocket` builds its own copy of `librocketnpu` from `ROCKETNPU_DIR` and passes the two
-provider settings down to it, which is why they are repeated here; the build from step 3 is
+provider settings down to it, which is why they are repeated here. The build from step 3 is
 what the gate suite in step 4 exercises. An explicit `ROCKETNPU_DIR` takes precedence over
 an installed `rocketnpu` package (a `cmake --install`, typically under `/usr/local`), and
 the configure log names which of the two it took. Left unset, the installed package wins,
@@ -280,14 +280,14 @@ ROCKET profile total(ms): pack=283 (packA=24 packB=18) gen=3 sync=12 submit=497 
 ```
 
 The third line is the one that matters. An op the backend declines runs on the CPU and
-still produces a complete, correct, normal-looking transcript, so a run that prints the
-first two lines and not the third ran its encoder on the CPU.
+still produces a complete, correct, normal-looking transcript. A run that prints the first
+two lines and not the third ran its encoder on the CPU.
 
 ### Performance
 
 The deliverable is CPU core-seconds handed back to the rest of the system, not wall-clock
 speed, and the two are different numbers. The process blocks on the NPU with its host
-threads idle, so the CPU freed is larger than the wall saved: `base.en` on a 30 s clip is a
+threads idle, so the CPU freed is larger than the wall saved. `base.en` on a 30 s clip is a
 1.10x wall and a 17.4% CPU saving. A wall ratio quoted as if it were a CPU saving is wrong
 in both directions depending on the clip.
 
@@ -295,12 +295,15 @@ There are two figures below, because they answer different questions and are not
 interchangeable.
 
 **Single-shot**, one clip per process, so the model load sits inside the number. Across
-`tiny.en`, `base.en` and `small.en` at 3, 10, 30, 60 and 120 s, the CPU freed is 16-50%. It
-rises with model size, and the largest relief is on **short** clips: every window is padded
-to 30 s whatever the audio, so a 3 s utterance pays a full encode and decodes almost
-nothing, and the encoder is the part that offloads. The realtime factor on the NPU arm
-(seconds of audio per second of wall) is 3-33x for `tiny.en`, 1.8-12.9x for `base.en` and
-0.7-5.8x for `small.en`; the sub-realtime cells are the short clips, where the fixed encode
+`tiny.en`, `base.en` and `small.en` at 3, 10, 30, 60 and 120 s, the CPU freed is 16-50%.
+
+It rises with model size, and the largest relief is on **short** clips. Every window is
+padded to 30 s whatever the audio. So a 3 s utterance pays a full encode and decodes almost
+nothing, and the encoder is the part that offloads.
+
+The realtime factor on the NPU arm is seconds of audio per second of wall. It runs 3-33x for
+`tiny.en`, 1.8-12.9x for `base.en` and 0.7-5.8x for `small.en`. The sub-realtime cells are
+the short clips, where the fixed encode
 and the model load dominate.
 
 **Steady state**, the shape a service actually has, with the model loaded once and the cost
@@ -317,27 +320,28 @@ taken per utterance on conversational audio. CPU core-seconds per utterance:
 
 What mostly separates the two figures is the model load, paid once per process: 129 ms for
 `tiny.en`, 173 ms for `base.en`, 333 ms for `small.en`. A CLI spawned per transmission pays
-it every time and throws much of the saving away; keep the model loaded.
+it every time and throws much of the saving away, so keep the model loaded.
 
 Measured on an RK3588 (Turing RK1) at 600 MHz on `rknpu 0.9.8` through this provider,
-A76-pinned, 4 threads, `ROCKET_KACC=1`, both arms of every comparison from one binary with
-the arms interleaved and the warm-up discarded. Discard the first run of anything measured
-here: the clock parks at idle, so a cold run reads about 15% low.
+A76-pinned, 4 threads, `ROCKET_KACC=1`. Both arms of every comparison come from one binary,
+with the arms interleaved and the warm-up discarded. Discard the first run of anything
+measured here, because the clock parks at idle and a cold run reads about 15% low.
 
 ### Numerical faithfulness
 
-The NPU encoder is fp16 where the CPU's is fp32, so the two are close and not bit-identical,
-and whether that reaches the transcript depends on the audio. Both arms are deterministic:
-every repetition within an arm is byte-identical, so a difference between them is the
-numerics and not a race.
+The NPU encoder is fp16 where the CPU's is fp32, so the two are close rather than
+bit-identical. Whether that reaches the transcript depends on the audio. Both arms are
+deterministic, and every repetition within an arm is byte-identical, so a difference between
+them is the numerics rather than a race.
 
 On clean read speech the transcripts are identical, for all three models at every length
-tested. On degraded audio they are not: `base.en` on a two-minute hard conversational clip
+tested. On degraded audio they are not. `base.en` on a two-minute hard conversational clip
 diverges by 66 word-level edits, a 153-word NPU transcript against a 169-word CPU one. The
-differences run in both directions and neither arm is ground truth; both are plausible
-readings of genuinely ambiguous overlapping speech. The divergence compounds with length
-rather than staying local, because a perturbation early in an autoregressive decode changes
-the prompt context for every window after it.
+differences run in both directions and neither arm is ground truth. Both are plausible
+readings of genuinely ambiguous overlapping speech.
+
+The divergence compounds with length rather than staying local. A perturbation early in an
+autoregressive decode changes the prompt context for every window after it.
 
 Radio and telephony audio is degraded audio. A benchmark on clean read speech will show the
 two arms agreeing exactly, and will not have tested the case that matters.
@@ -374,17 +378,17 @@ cmake --build build-gr-transcribe -j
 ```
 
 `GGML_CPU_ARM_ARCH` is load-bearing for the same reason as in step 5. `GGML_LIB_DIR` is this
-host's `build/ggml/src` rather than its `build/bin`; the CPU module is found separately.
+host's `build/ggml/src` rather than its `build/bin`, and the CPU module is found separately.
 
 **Two gaps in the host's own dynamic-backend path need working around**, neither of them
 this provider's and neither reported as what it is:
 
-- The CLI registers dynamic backends only on its `--list-devices` path, so a shared build
-  loads no backend at all when it transcribes and stops with `whisper: failed to initialize
+- The CLI registers dynamic backends only on its `--list-devices` path. A shared build then
+  loads no backend at all when it transcribes, and stops with `whisper: failed to initialize
   CPU backend`. Calling `transcribe_init_backends_default()` once before the model load in
   `examples/cli/main.cpp` is the whole fix.
-- The backend scan reads only the directory the library itself sits in, and the Arm CPU
-  module is a plain `libggml-cpu.so` elsewhere in the build: `cp build/bin/libggml-cpu.so
+- The backend scan reads only the directory the library itself sits in. The Arm CPU module
+  is a plain `libggml-cpu.so` elsewhere in the build, so run `cp build/bin/libggml-cpu.so
   build/src/`. Without it only the NPU registers, and the run fails as above.
 
 Then run it, with the module search path pointed at the build and the NPU supplied the same
@@ -398,16 +402,23 @@ GGML_BACKEND_PATH=../build-gr-transcribe/libggml-rocket.so ROCKET_KACC=1 \
 ```
 
 Its proof line reads `whisper: using accel backend: ROCKET`, and `ROCKET_MM_PROFILE=1`
-adds the same profile line, which remains the only evidence that work reached the device. `--list-devices` should show `kind=accel`, which is what puts the NPU
-ahead of the CPU in its scheduler.
+adds the same profile line, which remains the only evidence that work reached the device.
+`--list-devices` shows `kind=accel`, which is what puts the NPU ahead of the CPU in its
+scheduler.
 
 Measured on the validation board with `whisper-base.en-Q8_0` on an 11 s clip, medians of
-three interleaved runs: 1.88 s wall and 9.00 CPU core-seconds on the NPU against 2.97 s and
-21.70 on the CPU, so 1.58x wall and 58.5% of the core-seconds handed back, with the
-transcripts identical. Both arms take this CLI's default of every core, little cores
-included, which is why its core-second figures are roughly twice `whisper-cli`'s at four
-threads and why the ratio is not comparable to the tables above. Pinning to the big cores is
-worth more than it is here.
+three interleaved runs:
+
+| Arm | Wall | CPU core-seconds |
+|---|---:|---:|
+| NPU | 1.88 s | 9.00 |
+| CPU | 2.97 s | 21.70 |
+
+That is 1.58x wall and 58.5% of the core-seconds handed back, with the transcripts
+identical. Both arms take this CLI's default of every core, little cores included. Its
+core-second figures are therefore roughly twice `whisper-cli`'s at four threads, and the
+ratio is not comparable to the tables above. Pinning to the big cores is worth more than it
+is here.
 
 ### tflite-rocket: object detection
 
@@ -425,12 +436,12 @@ cmake -S tflite-rocket -B build-tflite-rocket \
 cmake --build build-tflite-rocket -j
 ```
 
-`TFLITE_DIR` is a header root: the delegate is a classic C `TfLiteDelegate` and needs only
+`TFLITE_DIR` is a header root. The delegate is a classic C `TfLiteDelegate` and needs only
 `tensorflow/lite/core/c/{common,builtin_op_data}.h` plus `tensorflow/lite/builtin_ops.h`.
 The build also produces `libtflite_cshim.so`, which supplies the two TFLite C-API symbols
 the delegate binds at `dlopen`. The classic `tflite_runtime` and full `tensorflow` wheels
-export them; LiteRT (`ai_edge_litert`, the wheel on recent Python) keeps them internal, so
-under LiteRT, `LD_PRELOAD` the shim; without it the delegate stops at
+export them. LiteRT (`ai_edge_litert`, the wheel on recent Python) keeps them internal, so
+under LiteRT, `LD_PRELOAD` the shim. Without it the delegate stops at
 `undefined symbol: TfLiteIntArrayCreate`.
 
 ```sh
@@ -449,11 +460,13 @@ the convolutions are offered to the external delegate first. Under the default r
 XNNPACK claims them and the model runs entirely on the CPU while its log still reads as
 delegated. The delegate's `profile=1` option prints the per-op line that settles it.
 
-Measured against the mainline `rocket` driver on the same silicon, from the same sources, with
-both boards clock-matched at 600 MHz: **the detectors' outputs are identical at the byte**. An
-MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 agrees across the two
-drivers in the CPU, `native_int8=1` and `native_int8=0` arms, with every on-NPU auxiliary route
-enabled, and on the fp16-NCHW resident path. Warm single-inference latency is 202.1 ms against
+Both boards were clock-matched at 600 MHz, and both builds came from the same sources.
+Measured that way against the mainline `rocket` driver, **the detectors' outputs are
+identical at the byte**.
+
+An MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 agrees across the
+two drivers. That holds in the CPU, `native_int8=1` and `native_int8=0` arms, with every
+on-NPU auxiliary route enabled, and on the fp16-NCHW resident path. Warm single-inference latency is 202.1 ms against
 mainline's 197.9 for MobileDet and 299.6 against 293.6 for EfficientDet-Lite0. That 2%
 falls on a host-bound workload, and the two boards' CPU ceilings differ by as much on their
 own. Four concurrent detection processes, the shape a
@@ -472,9 +485,10 @@ aggregate 3.51x against mainline's 3.61x.
 
 `RKNPU_IOVA_TIGHT` protects the IOMMU domain, and is worth understanding before turning it
 off. This driver maps every buffer through **one domain shared across the whole process**.
+
 On the generic path a single 2048-token prefill (Llama-3.2-3B F16, 153 s) permanently costs
-that domain 5-11 of the 31 128 MiB buffers it can serve, and the loss outlives the process,
-so only a reboot resets it. With the flag set the same run costs **zero**. Throughput is
+that domain 5-11 of the 31 128 MiB buffers it can serve. The loss outlives the process, so
+only a reboot resets it. With the flag set the same run costs **zero**. Throughput is
 identical either way (39.90-41.39 tokens/s at 2048, 67.57 at 512 in both arms), so the flag
 buys headroom rather than speed.
 
@@ -483,7 +497,7 @@ Two consequences follow:
 - **Alongside a stock RKNN userspace**, which takes the generic path, this process can meet
   `-ENOMEM` while the domain still holds space it cannot reach. A large refusal is worth
   retrying smaller, and `librocketnpu` does that where it can.
-- **A board with unknown uptime may already be degraded.** Check the domain before trusting
+- **A board with unknown uptime can already be degraded.** Check the domain before trusting
   an allocation-sensitive measurement on one.
 
 The kernel-side mechanism, and the measurements that isolated it, are in the comment above
@@ -493,7 +507,7 @@ The kernel-side mechanism, and the measurements that isolated it, are in the com
 
 Reference for readers tuning the defaults above or changing the provider. The vendor uAPI
 differs from the mainline driver in buffer identity, job structure and submit semantics. The
-provider absorbs each difference; the table states the behavior and where it surfaces.
+provider absorbs each difference, and the table states the behavior and where it surfaces.
 
 | Behavior | This driver | How the provider expresses it |
 |---|---|---|
@@ -512,7 +526,8 @@ every allocation would fail. Refusing at open makes that one clear message inste
 unexplained failure partway into a run.
 
 **On 0.9.6, `RKNPU_IOVA_TIGHT` is unavailable.** The flag it sets arrived in 0.9.7, and an
-older driver accepts it and ignores it, so the provider withholds it and says so at open.
+older driver accepts it and ignores it. The provider therefore withholds it and says so at
+open.
 Buffers then take the generic path, with the consequences under
 [Runtime configuration](#runtime-configuration).
 
@@ -526,31 +541,35 @@ The structure-level differences behind these thresholds are in `src/rknpu_uapi.h
 
 The driver programs `PC_DATA_ADDR` and `PC_DATA_AMOUNT` from the first task, writes the
 task count into `PC_TASK_CONTROL`, and kicks once. A job of *n* tasks is therefore one
-contiguous stream of *n* register programs whose own trailers link to the next: the
-layout `librocketnpu`'s `rocket_chain.c` builds, and the multi-program shape this uAPI
-takes natively. It needs no kernel patch here.
+contiguous stream of *n* register programs whose own trailers link to the next. That is the
+layout `librocketnpu`'s `rocket_chain.c` builds, and the multi-program shape this uAPI takes
+natively. It needs no kernel patch here.
 
 Because each submit is its own job, the driver takes the next entry off its per-core
-`todo_list` as soon as one retires, and another thread's or another process's job can land
-between two programs. CBUF operand reuse depends on the previous task's operand still
-being resident, so it is valid exactly when the batch is chained: with reuse enabled and
-an unchained batch, one 128×1024×1024 fp16 matmul at three-way fan-out produced a corrupt
-result on 29 of 120 runs, against 0 of 120 with reuse disabled and 0 of 80 chained. The
-corruption is a full, plausible output surface that moves between runs.
+`todo_list` as soon as one retires. Another thread's or another process's job can land
+between two programs.
+
+CBUF operand reuse depends on the previous task's operand still being resident, so it is
+valid exactly when the batch is chained. With reuse enabled and an unchained batch, one
+128×1024×1024 fp16 matmul at three-way fan-out produced a corrupt result on 29 of 120 runs.
+That is against 0 of 120 with reuse disabled and 0 of 80 chained. The corruption is a full,
+plausible output surface that moves between runs.
 
 `librocketnpu` queries this directly. `rocket_submit_batch_atomic()` reports whether a
-batch runs as one job (0 here, 1 on mainline) and gates reuse on the answer;
-`rocket_batched_submit_native()` reports that the chained layout is native to this uAPI,
-and `ROCKET_BATCH_SUBMIT` takes its default from that.
+batch runs as one job (0 here, 1 on mainline) and gates reuse on the answer.
+`rocket_batched_submit_native()` reports that the chained layout is native to this uAPI, and
+`ROCKET_BATCH_SUBMIT` takes its default from that.
 
 ### Naming the completing block
 
 The driver completes a job when the interrupt status collapses to the `INT_MASK` its last
-task carries, so each program names the block it finishes on. A program ending in a DPU
-write uses the DPU pair (`0x300`); a pooling program ends on the PPU pair (`0xc00`), which
-the batched-job `PPU_DONE` flag selects. Naming a block that fires earlier retires the job
-at that point: hardware elapsed time falls from 121 to 79 microseconds with a `0x3` mask
-at 64×256×256. The mask therefore follows the program's terminal stage.
+task carries. Each program therefore names the block it finishes on. A program ending in a
+DPU write uses the DPU pair (`0x300`). A pooling program ends on the PPU pair (`0xc00`),
+which the batched-job `PPU_DONE` flag selects.
+
+Naming a block that fires earlier retires the job at that point. Hardware elapsed time falls
+from 121 to 79 microseconds with a `0x3` mask at 64×256×256. The mask therefore follows the
+program's terminal stage.
 
 ## Throughput
 
@@ -566,26 +585,27 @@ three warm rounds, RK3588 at the vendor driver's 1000 MHz idle clock:
 | The same shape through mainline `rocket`, for reference | 23.5-24.4 | 660-685 |
 
 The two defaults compose. Letting the driver schedule cores gives the library's multi-core
-fan-out somewhere to fan out to, and the chained layout removes both the extra ioctls and
-the reuse restriction.
+fan-out somewhere to fan out to. The chained layout removes both the extra ioctls and the
+reuse restriction.
 
 ## Instruments
 
 `include/rknpu_submit.h` exposes the measurement surface this uAPI carries:
 
 - `rknpu_last_hw_elapse_ns()`: hardware elapsed time of the last submit on a file
-  descriptor. The driver stamps it as a `ktime` pair around the register-program commit,
-  so it spans the register write burst, execution and interrupt latency, and is scoped to
-  the most recent submit on that descriptor.
+  descriptor. The driver stamps it as a `ktime` pair around the register-program commit, so
+  it spans the register write burst, execution and interrupt latency. It is scoped to the
+  most recent submit on that descriptor.
 - `rknpu_action()`: the raw action ioctl behind the clock, voltage, IOMMU-domain, SRAM
   and DMA-counter queries.
 
 Query availability before planning a measurement. The DMA byte counters, the SRAM and NBUF
-pools, and bandwidth QoS are wired on RK3576, RK356x, RK3562, RV1106 and RV1126B. On
-RK3588 the driver configuration leaves the counter registers unset and the NBUF size at
-zero, so those queries return 0 and the driver logs `Get rw_amount is not supported on
-this device!`; per-submit hardware elapsed time, the clock and voltage queries, and the
-IOMMU domain identifier are available there.
+pools, and bandwidth QoS are wired on RK3576, RK356x, RK3562, RV1106 and RV1126B.
+
+On RK3588 the driver configuration leaves the counter registers unset and the NBUF size at
+zero. Those queries return 0, and the driver logs `Get rw_amount is not supported on this
+device!`. Per-submit hardware elapsed time, the clock and voltage queries, and the IOMMU
+domain identifier are available there.
 
 ## Validation
 
