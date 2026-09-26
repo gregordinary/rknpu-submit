@@ -86,8 +86,11 @@ varies by board. Sysfs names the driver behind each node:
 
 ```sh
 ls -l /sys/class/drm/renderD*/device/driver
-# .../renderD129/device/driver -> ../../../../bus/platform/drivers/rknpu
+# .../renderD129/device/driver -> ../../../bus/platform/drivers/RKNPU
 ```
+
+The platform driver registers as `RKNPU` in capitals (`rknpu_drv.c` in the BSP driver tree),
+so sysfs paths take that spelling. The DRM driver name the provider matches is `rknpu`.
 
 **2. Build the provider.** It implements `rocket_npu.h`, so it needs that header alone and
 links nothing from `librocketnpu`.
@@ -117,7 +120,17 @@ on the device.
 
 ```sh
 cd build && ctest --output-on-failure -j1 --timeout 300
-# 93 tests passed out of 93
+# 100% tests passed, 0 tests failed out of <n>
+```
+
+On an RK3588 the RK3576 gates report `Skipped`, the suite's code for a part that is absent.
+The SigLIP and SAM gates skip too, without their model weights. Two gates,
+`npu_klog_check` and `uapi_bo_lifetime_rocket`, read the kernel journal. If your account
+cannot read it, they skip. `npu_klog_check` fails the run on any NPU job timeout or IOMMU
+fault logged during it, so join `adm` to keep it:
+
+```sh
+sudo usermod -aG adm "$USER"   # then log out and back in
 ```
 
 This is the first step that touches the hardware, so it needs the device access from
@@ -139,7 +152,7 @@ for the display subsystem. Check whether `rknpu` bound at all:
 
 ```sh
 sudo dmesg | grep -i "Initialized rknpu"  # either "Initialized" line once it probes
-ls -d /sys/bus/platform/drivers/rknpu/*   # the device it bound to, e.g. fdab0000.npu
+ls -d /sys/bus/platform/drivers/RKNPU/*   # the device it bound to, e.g. fdab0000.npu
 sudo cat /sys/kernel/debug/rknpu/version
 ```
 
@@ -692,19 +705,22 @@ domain identifier are available there.
 
 ## Validation
 
-Measured on an RK3588 (Turing RK1), Armbian `6.1.115-vendor-rk35xx`, `rknpu 0.9.8
-20240828`, NPU at `/dev/dri/renderD129`.
+Measured on an RK3588 (Turing RK1), Armbian `6.1.172-vendor-rk35xx`, `rknpu 0.9.8
+20240828`, NPU at `/dev/dri/renderD129`, on 2026-09-26.
 
 The path was walked from fresh clones, following the steps above as written:
 
 | Component | Version walked | Result |
 |---|---|---|
-| `rknpu-submit` | `fc03e06` | Configures and builds with no errors; `provider_seam` passes |
-| `rocket-userspace` | `4ea88f1` | Builds; a 29-test hardware subset passes |
-| `ggml-rocket` | `173b763` | Builds; `libggml-rocket.so` loads |
-| `whisper.cpp` | master `v1.9.3-75-g9781133` | `whisper-cli` prints all three lines of step 8 |
+| `rknpu-submit` | `db7c3ab` | Configures and builds with no errors, and `provider_seam` passes |
+| `rocket-userspace` | `c7e7c47` | Builds. The full suite passes: 76 of 97 run, and 21 skip as step 4 describes |
+| `ggml-rocket` | `cfcc0f5` | Builds against the provider, and `libggml-rocket.so` loads |
+| `whisper.cpp` | master `d09f61a` | `whisper-cli` prints all three lines of step 8, and its `samples/jfk.wav` transcript matches the CPU run's |
 | `transcribe.cpp` | `c6a9257` | Selects the NPU as an `accel` device and offloads, with the two host-side workarounds its section names |
 | `tflite-rocket` | unrecorded | `convert_test` at 220 cases and 0 failures; six driver-level probes pass, including a 1494-shape CBUF bank-slack sweep at zero error; detector outputs byte-identical to mainline |
+
+The `transcribe.cpp` and `tflite-rocket` rows are from an earlier walk on
+`6.1.115-vendor-rk35xx`, with the same driver.
 
 `ctest` in `build-rknpu`, the provider's own build directory, runs `provider_seam`. It
 needs no hardware: it checks that this provider defines every symbol `rocket_npu.h`
