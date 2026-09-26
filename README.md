@@ -346,6 +346,89 @@ autoregressive decode changes the prompt context for every window after it.
 Radio and telephony audio is degraded audio. A benchmark on clean read speech will show the
 two arms agreeing exactly, and will not have tested the case that matters.
 
+### Running as a service
+
+A transcription service keeps `whisper-server` loaded and posts it audio in chunks. OpenWebRX+
+(1.2.123 and later) does exactly that. Every `chunkSeconds` of wall time, 20 s by default, it
+posts the squelch-gated audio that arrived as one 12 kHz WAV. It sends no other request field
+and reads `text` from the reply.
+
+Two things follow. The server's command-line defaults decide every decode parameter, because
+the client sends none. And every request costs one full encode,
+because whisper pads a window to 30 s whatever the chunk holds.
+
+`whisper-server` is built beside `whisper-cli` in step 5. Start it the way step 7 starts the
+CLI, pinned to the A76 cluster:
+
+```sh
+GGML_BACKEND_PATH=$PWD/build-ggml-rocket/libggml-rocket.so ROCKET_KACC=1 \
+  taskset -c 4-7 ./whisper.cpp/build/bin/whisper-server \
+  -m whisper.cpp/models/ggml-small.bin -t 4 -nt -ac 1200 -sns \
+  --host 127.0.0.1 --port 8080
+```
+
+Four settings decide the cost, and each one is a rule rather than a number:
+
+- **`-ac` is 50 times the chunk length plus 4 s.** That is 1200 for a 20 s chunk, and the
+  default of 1500 for a 30 s one. The encoder then covers the audio and the silence after it.
+  Set to the chunk length itself, it halves the encode and breaks the decoder. Every chunk
+  transcribes correctly to the audio's end and then runs on into a loop. The model never sees
+  the silence that closes an utterance.
+- **`-nt` (no timestamps) is free.** It returns 12% of the CPU at equal accuracy, and a 30 s
+  chunk requires it. With timestamps on, a chunk whose last timestamp lands short of the
+  audio's end has its remainder encoded again as a second window. A 30 s chunk is cut mid-word
+  at the window's edge, so that happens on most of them. Plain 30 s chunks therefore cost 13%
+  more CPU per second of audio than 20 s ones.
+- **Send `temperature_inc=0` as a request field** to turn off the temperature fallback. The
+  fallback re-decodes a window the decoder is unsure of up to five more times, at about three
+  times a normal request's cost. The server's `-nf` flag is parsed and never applied. With
+  `-nt` the fallback rarely fires. Turning it off costs a small accuracy margin on the chunks
+  it was re-decoding, so it is a judgment call.
+- **`-sns` (suppress non-speech tokens) costs nothing** and improves accuracy on every channel
+  condition measured. On audio whisper cannot parse, it otherwise emits runs of bracket tokens
+  and can loop on them for hundreds of tokens.
+
+Where the client cannot add a field, the server flag is one line away from working, in
+`examples/server/server.cpp`:
+
+```diff
+-            wparams.temperature_inc  = params.temperature_inc;
++            wparams.temperature_inc  = params.no_fallback ? 0.0f : params.temperature_inc;
+```
+
+The table is CPU core-seconds per second of channel time for `ggml-small`, on read speech
+through an SSB-shaped channel at 15 dB SNR. It is relative to the server's defaults on 20 s
+chunks with the NPU, which are themselves 0.58x the CPU-only run. WER is against the
+LibriSpeech reference, on clean speech and on the 15 dB channel, and the chunk cuts set its
+floor:
+
+| Configuration | CPU | Request | WER clean / 15 dB |
+|---|---:|---:|---|
+| CPU only, defaults, 20 s chunks | 1.73 | 7.7 s | 8.9 / 16.8 |
+| NPU, defaults, 20 s chunks | 1.00 | 5.3 s | 8.9 / 16.7 |
+| NPU, `-nt`, 20 s chunks | 0.96 | 5.0 s | 9.5 / 15.8 |
+| NPU, `-nt -ac 1200`, `temperature_inc=0`, 20 s chunks | 0.78 | 4.1 s | 9.3 / 15.2 |
+| NPU, `-nt -ac 1200 -sns`, `temperature_inc=0`, 20 s chunks | 0.77 | 4.1 s | 7.7 / 13.8 |
+| NPU, `-nt`, `temperature_inc=0`, 25 s chunks | 0.85 | 5.0 s | 8.3 / 15.0 |
+| NPU, `-nt`, `temperature_inc=0`, 30 s chunks | 0.74 | 5.8 s | 5.3 / 19.0 |
+| NPU, defaults, 30 s chunks | 1.21 | 9.6 s | 5.8 / 14.0 |
+
+The 20 s rows keep the latency and return 22-23% of the CPU at the same or better accuracy.
+The 30 s row returns 26% with the best clean-speech accuracy and a two- to five-point loss on the
+noisy channel, at 30 s of latency. A second speaker confirmed the ranking. Across all three channel conditions the `-sns` row reads 0.70 and
+the 30 s row 0.65.
+
+Two things do not help. A quantized model costs more here. `ggml-small-q8_0` takes 10% more CPU
+than F16, because whisper leaves its weight tensors unnamed. That keeps the quantized encoder
+off the resident route, so every request dequantizes it again. And `-t 2` saves 12% of the CPU
+for a request half again as long, with the same transcript. That is a trade rather than a
+saving.
+
+Measured on an RK3588 (Turing RK1) at 600 MHz, A76-pinned, 4 threads, `ROCKET_KACC=1`, on
+whisper.cpp master at `eacbd82`. The server is billed by its own CPU time per request, and the
+arms are rotated across two passes. These are host-side whisper.cpp settings, so they carry
+across the driver. The provider numbers above are the vendor-path ones.
+
 ## Other frontends
 
 Two other frontends reach this NPU by the same route: each links `librocketnpu`, which
