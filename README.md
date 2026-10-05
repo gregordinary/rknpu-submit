@@ -250,10 +250,10 @@ cmake -S ggml-rocket -B build-ggml-rocket \
 cmake --build build-ggml-rocket -j
 ```
 
-`HOST_DIR` and `GGML_LIB_DIR` point at the host application's own bundled `ggml`. The
-backend vtable is positional, so a matching `GGML_BACKEND_API_VERSION` is what makes the
-device appear. A `.so` built against a different `ggml` checkout loads cleanly and registers
-no device.
+`HOST_DIR` and `GGML_LIB_DIR` point at the host application's own bundled `ggml`, and the
+backend must be built against it. A `.so` built against a different `ggml` checkout registers no
+device. The host's loader refuses a different `GGML_BACKEND_API_VERSION`, and the backend refuses
+a host whose op numbering moved.
 
 `ROCKETNPU_DRIVER_NAME` is cosmetic and worth setting. It is what a frontend prints in its
 device listing, and it names which kernel path is live. Left unset, an external build
