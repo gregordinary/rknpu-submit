@@ -59,10 +59,16 @@ independently of the kernel it ships in, so read the version rather than inferri
 two node flavors announce themselves differently, and `-i` catches both:
 
 ```sh
-sudo dmesg | grep -i "Initialized rknpu"
-# [drm] Initialized rknpu 0.9.8 20240828 for fdab0000.npu on minor 1  <- DRM_GEM build
-# rknpu fdab0000.npu: Initialized RKNPU driver: v0.9.8 for 20240828   <- DMA_HEAP build
+sudo journalctl -b -k | grep -i "Initialized rknpu"
+# ... kernel: [drm] Initialized rknpu 0.9.8 20240828 for fdab0000.npu on minor 1  <- DRM_GEM build
+# ... kernel: rknpu fdab0000.npu: Initialized RKNPU driver: v0.9.8 for 20240828   <- DMA_HEAP build
 ```
+
+The line prints once, as the driver probes, which is normally at boot. The journal keeps
+this boot's kernel messages, while `dmesg` reads a fixed-size ring buffer that rolls over. On
+a board that has been up for days, `dmesg` can return nothing for a driver that did probe.
+Where there is no journal, run `sudo dmesg | grep -i "Initialized rknpu"` instead, and read
+an empty result as unproven.
 
 Device discovery matches the DRM driver name `rknpu`, which is fixed across driver
 versions. The version governs the uAPI, and the provider reads it at open and acts on it.
@@ -151,8 +157,8 @@ as in [Requirements](#requirements), or re-run under `sudo -E`.
 for the display subsystem. Check whether `rknpu` bound at all:
 
 ```sh
-sudo dmesg | grep -i "Initialized rknpu"  # either "Initialized" line once it probes
-ls -d /sys/bus/platform/drivers/RKNPU/*   # the device it bound to, e.g. fdab0000.npu
+sudo journalctl -b -k | grep -i "Initialized rknpu"  # either "Initialized" line once it probes
+ls -d /sys/bus/platform/drivers/RKNPU/*              # the device it bound to, e.g. fdab0000.npu
 sudo cat /sys/kernel/debug/rknpu/version
 ```
 
@@ -444,9 +450,14 @@ across the driver. The provider numbers above are the vendor-path ones.
 
 ## Other frontends
 
-Two other frontends reach this NPU by the same route: each links `librocketnpu`, which
+Three other frontends reach this NPU by the same route: each links `librocketnpu`, which
 steps 1 through 4 have already pointed at the vendor driver. Those steps are unchanged in
-both cases, and only the frontend build differs.
+each case, and only the frontend build differs. Two of them have walkthroughs below.
+
+The third is [`ort-rocket`](https://github.com/gregordinary/ort-rocket), an ONNX Runtime
+execution provider. Its build takes the same `ROCKETNPU_*` cache entries as the
+`tflite-rocket` build below. On 2026-08-26 it ran RF-DETR-nano at 384×384 under ONNX Runtime
+1.29.0 on both drivers, and every output tensor's MD5 matched [HW sweep].
 
 ### transcribe.cpp: further model families
 
@@ -556,18 +567,23 @@ the convolutions are offered to the external delegate first. Under the default r
 XNNPACK claims them and the model runs entirely on the CPU while its log still reads as
 delegated. The delegate's `profile=1` option prints the per-op line that settles it.
 
-Both boards were clock-matched at 600 MHz, and both builds came from the same sources.
-Measured that way against the mainline `rocket` driver, **the detectors' outputs are
-identical at the byte**.
+The comparison ran on two RK3588 boards, one per driver. Both were clock-matched at 600 MHz,
+and both builds came from the same sources. Measured that way against the mainline `rocket` driver on 2026-08-26, **the detectors'
+outputs were identical at the byte**.
 
-An MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 agrees across the
-two drivers. That holds in the CPU, `native_int8=1` and `native_int8=0` arms, with every
-on-NPU auxiliary route enabled, and on the fp16-NCHW resident path. Warm single-inference latency is 202.1 ms against
-mainline's 197.9 for MobileDet and 299.6 against 293.6 for EfficientDet-Lite0. That 2%
-falls on a host-bound workload, and the two boards' CPU ceilings differ by as much on their
-own. Four concurrent detection processes, the shape a
-multi-camera deployment takes, produce the single-process output hash on both drivers and
-aggregate 3.51x against mainline's 3.61x.
+An MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 agreed across the
+two drivers. That held in the CPU, `native_int8=1` and `native_int8=0` arms, with every
+on-NPU auxiliary route enabled, and on the fp16-NCHW resident path. Warm single-inference
+latency was 202.1 ms against mainline's 197.9 for MobileDet and 299.6 against 293.6 for
+EfficientDet-Lite0. That 2% fell on a host-bound workload, and the two boards' CPU ceilings
+differ by as much on their own. Four concurrent detection processes, the shape a multi-camera
+deployment takes, produced the single-process output hash on both drivers and aggregated 3.51x
+against mainline's 3.61x.
+
+Those figures are the delegate as built on 2026-08-26. The current delegate's `native_int8`
+defaults requantize on chip through `rocket_conv2d_int8_q`, `rocket_conv2d_int8_q_perc` and the
+uint8 and per-axis depthwise entries. Those routes have not run through this provider at the
+delegate level.
 
 ## Runtime configuration
 
