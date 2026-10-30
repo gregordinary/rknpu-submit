@@ -19,9 +19,9 @@
  *
  * ---- Three places the two uAPIs genuinely differ ----------------------------
  *
- * 1. BOs are keyed on an OBJECT ADDRESS, not just a GEM handle. MEM_DESTROY and
- *    MEM_SYNC both take `obj_addr`, so rocket_bo carries the field (inert on the
- *    mainline provider, which leaves it 0).
+ * 1. BOs are keyed on an OBJECT ADDRESS, not just a GEM handle. MEM_SYNC takes
+ *    `obj_addr` (MEM_DESTROY keys on the handle on this DRM build), so rocket_bo
+ *    carries the field (inert on the mainline provider, which leaves it 0).
  *
  * 2. The task array lives in DEVICE memory. rknpu_submit carries `task_obj_addr`, and
  *    the driver reads the array through the object's KERNEL mapping — so the task BO
@@ -65,11 +65,9 @@ static size_t page_up(size_t n) { return (n + RKNPU_PAGE - 1) & ~(size_t)(RKNPU_
 /* ============================================================================
  * SECTION — per-fd device state
  *
- * The seam hands round a bare int fd, but two things about a device do not fit in
- * one: whether it is the DRM render node or the misc /dev/rknpu node (the ioctl
- * MAGIC differs — both are compiled from the same handler, so either may be what a
- * given build exposes), and the task BO this provider owns on that fd. A table keyed
- * on the fd carries both.
+ * The seam hands round a bare int fd, but some of a device's state does not fit in
+ * one: the driver version read at open, and the task BO this provider owns on that
+ * fd. A table keyed on the fd carries both.
  *
  * INDEXED BY THE FD, not searched. What this table sizes is not how many DEVICES
  * exist — it is how many fds one process holds open at once, and the library opens
@@ -93,7 +91,6 @@ struct rknpu_bo_priv { uint32_t handle; uint64_t obj_addr; uint64_t dma_addr; si
 
 struct rknpu_dev {
     int  fd;             /* -1 = free slot */
-    int  is_drm;         /* 1 = DRM render node ('d' magic), 0 = /dev/rknpu ('r') */
     uint32_t drv_version;          /* RKNPU_GET_DRV_VERSION code, 0 if unreadable */
     struct rknpu_bo_priv taskbo;   /* the rknpu_task[] array, grown on demand */
     uint32_t taskbo_cap;           /* how many rknpu_task entries it holds     */
@@ -141,13 +138,11 @@ static struct rknpu_dev *dev_find(int fd)
     return (d && d->fd == fd) ? d : NULL;
 }
 
-/* The ioctl request word. The DRM node encodes on 'd' + DRM_COMMAND_BASE; the misc
- * node on 'r' with the bare command number. Same handler behind both. */
-static unsigned long ioc(const struct rknpu_dev *d, unsigned nr, size_t sz)
+/* The ioctl request word: 'd' + DRM_COMMAND_BASE, the DRM render node's encoding. */
+static unsigned long ioc(unsigned nr, size_t sz)
 {
-    return d->is_drm ? (unsigned long)_IOC(_IOC_READ | _IOC_WRITE, RKNPU_DRM_IOCTL_BASE,
-                                           RKNPU_DRM_COMMAND_BASE + nr, sz)
-                     : (unsigned long)_IOC(_IOC_READ | _IOC_WRITE, 'r', nr, sz);
+    return (unsigned long)_IOC(_IOC_READ | _IOC_WRITE, RKNPU_DRM_IOCTL_BASE,
+                               RKNPU_DRM_COMMAND_BASE + nr, sz);
 }
 
 /* ============================================================================
@@ -195,8 +190,9 @@ void rocket_submit_counters_reset(void)
  * generic path LEAKS the shared IOMMU domain and this one does not.
  *
  * What it buys, llama.cpp pp2048 on Llama-3.2-3B F16 [HW sweep, rknpu 0.9.8, 2026-08-25]:
- * one 153 s run with the flag off costs the process-wide domain 5-11 of its 31 128 MiB
- * buffers, permanently -- the loss outlives the process and only a reboot resets it.
+ * one 153 s run with the flag off costs the device's domain 5-11 of its 31 128 MiB
+ * buffers -- the loss outlives the process; a reboot recovers it, as does the flush
+ * described below.
  * With the flag on the same run costs ZERO: four such arms, interleaved around the
  * leaking ones, left all four size counts byte-identical. Throughput is the same either
  * way (39.90-41.39 t/s across five runs), so this is headroom and not speed.
@@ -208,7 +204,8 @@ void rocket_submit_counters_reset(void)
  * rcache. free_iova_fast() parks the range in a magazine or the global depot, and
  * alloc_iova() NEVER consults the rcache -- so space freed on the generic route is
  * unreachable to the driver's own route. The rcache belongs to the iova_domain, which
- * here is one domain shared process-wide, which is why the loss outlives the process.
+ * here is one domain per device, shared by every process that opens it, which is why
+ * the loss outlives the process.
  *
  * iova_rcache_insert() takes only sizes up to 32 pages (128 KiB), and that bound is the
  * proof [HW sweep, 2026-08-26, fresh domain per arm, 4400 buffers churned and every one
@@ -269,7 +266,7 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
      * request becomes unmappable once CMA runs short, silently and only under load. */
     c.flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU |
               RKNPU_MEM_ZEROING | rknpu_iova_tight_flag(d) | extra;
-    if (ioctl(d->fd, ioc(d, RKNPU_MEM_CREATE_NR, sizeof c), &c) < 0) {
+    if (ioctl(d->fd, ioc(RKNPU_MEM_CREATE_NR, sizeof c), &c) < 0) {
         int e = errno;
         RKNPU_LOGE("MEM_CREATE(%zu): %s\n", mapped, strerror(e));
         /* The request word carries sizeof(struct rknpu_mem_create), so a driver whose
@@ -284,11 +281,11 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
     }
     memset(&m, 0, sizeof m);
     m.handle = c.handle;
-    if (ioctl(d->fd, ioc(d, RKNPU_MEM_MAP_NR, sizeof m), &m) < 0) {
+    if (ioctl(d->fd, ioc(RKNPU_MEM_MAP_NR, sizeof m), &m) < 0) {
         int e = errno;
         struct rknpu_mem_destroy z = { .handle = c.handle, .obj_addr = c.obj_addr };
         RKNPU_LOGE("MEM_MAP(handle=%u): %s\n", c.handle, strerror(e));
-        ioctl(d->fd, ioc(d, RKNPU_MEM_DESTROY_NR, sizeof z), &z);
+        ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z);
         return -e;
     }
     void *p = mmap(NULL, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, (off_t)m.offset);
@@ -296,7 +293,7 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
         int e = errno;
         struct rknpu_mem_destroy z = { .handle = c.handle, .obj_addr = c.obj_addr };
         RKNPU_LOGE("mmap(handle=%u, %zu): %s\n", c.handle, mapped, strerror(e));
-        ioctl(d->fd, ioc(d, RKNPU_MEM_DESTROY_NR, sizeof z), &z);
+        ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z);
         return -e;
     }
     b->handle = c.handle; b->obj_addr = c.obj_addr; b->dma_addr = c.dma_addr;
@@ -323,7 +320,7 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
             memset(&sy, 0, sizeof sy);
             sy.obj_addr = c.obj_addr; sy.offset = 0; sy.size = mapped;
             sy.flags = RKNPU_MEM_SYNC_TO_DEVICE;
-            if (ioctl(d->fd, ioc(d, RKNPU_MEM_SYNC_NR, sizeof sy), &sy) < 0)
+            if (ioctl(d->fd, ioc(RKNPU_MEM_SYNC_NR, sizeof sy), &sy) < 0)
                 RKNPU_LOGE("BO prefill MEM_SYNC(handle=%u): %s\n", c.handle,
                            strerror(errno));
         }
@@ -340,7 +337,7 @@ static void bo_destroy(struct rknpu_dev *d, struct rknpu_bo_priv *b)
         b->ptr = NULL;
     }
     struct rknpu_mem_destroy z = { .handle = b->handle, .obj_addr = b->obj_addr };
-    if (ioctl(d->fd, ioc(d, RKNPU_MEM_DESTROY_NR, sizeof z), &z) < 0)
+    if (ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z) < 0)
         RKNPU_LOGE("MEM_DESTROY(handle=%u): %s — leaking the object and its IOVA\n",
                    b->handle, strerror(errno));
     b->handle = 0;
@@ -352,7 +349,7 @@ static int bo_sync(struct rknpu_dev *d, uint64_t obj_addr, uint64_t off, uint64_
     struct rknpu_mem_sync s;
     memset(&s, 0, sizeof s);
     s.obj_addr = obj_addr; s.offset = off; s.size = len; s.flags = dir;
-    if (ioctl(d->fd, ioc(d, RKNPU_MEM_SYNC_NR, sizeof s), &s) < 0) {
+    if (ioctl(d->fd, ioc(RKNPU_MEM_SYNC_NR, sizeof s), &s) < 0) {
         int e = errno;
         RKNPU_LOGE("MEM_SYNC(dir=0x%x, obj=0x%llx, %llu..%llu): %s\n", dir,
                    (unsigned long long)obj_addr, (unsigned long long)off,
@@ -372,6 +369,26 @@ static int bo_sync(struct rknpu_dev *d, uint64_t obj_addr, uint64_t off, uint64_
 #define RKNPU_RENDER_FIRST 128
 #define RKNPU_RENDER_LAST  143
 
+/* The misc /dev/rknpu node is what CONFIG_ROCKCHIP_RKNPU_DMA_HEAP registers in place of
+ * the render node. That build answers RKNPU_MEM_MAP with -EINVAL (its case falls
+ * through) and its file operations have no mmap [source-confirmed: BSP rknpu_drv.c,
+ * 0.9.8], so no buffer this provider creates could be mapped. Refused at open with one
+ * message, as a pre-0.9.6 driver is, instead of failing on every allocation. */
+static int refuse_misc_node(const char *path, int forced)
+{
+#define RKNPU_MISC_WHY "the driver was built with CONFIG_ROCKCHIP_RKNPU_DMA_HEAP. That " \
+        "build rejects RKNPU_MEM_MAP and cannot map a buffer into the process, so every " \
+        "allocation would fail. Refusing at open instead. A kernel built with " \
+        "CONFIG_ROCKCHIP_RKNPU_DRM_GEM presents the render node this provider speaks.\n"
+    if (forced)
+        RKNPU_LOGE("%s answers no DRM VERSION, so it is not a DRM render node. If it is "
+                   "the rknpu misc node, " RKNPU_MISC_WHY, path);
+    else
+        RKNPU_LOGE("%s is the rknpu misc node, so " RKNPU_MISC_WHY, path);
+#undef RKNPU_MISC_WHY
+    return -ENOTSUP;
+}
+
 /* Probe by DRM DRIVER NAME, never by node number. On the boards this was written
  * against the NPU is renderD129 and renderD128 is the display subsystem; that
  * ordering is a property of probe order and must not be assumed. ROCKET_DEV forces a
@@ -383,13 +400,20 @@ static int open_node(struct rknpu_dev *d)
 
     if (forced && *forced) {
         int fd = open(forced, O_RDWR | O_CLOEXEC);
-        if (fd < 0) { RKNPU_LOGE("open(%s): %s\n", forced, strerror(errno)); return -errno; }
+        if (fd < 0) {
+            int e = errno;
+            RKNPU_LOGE("open(%s): %s\n", forced, strerror(e));
+            return -e;
+        }
         struct rknpu_drm_version v;
         memset(&v, 0, sizeof v); memset(namebuf, 0, sizeof namebuf);
         v.name_len = sizeof namebuf - 1; v.name = namebuf;
         /* A misc node answers no DRM VERSION; that is how the two are told apart. */
-        d->is_drm = (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) == 0);
-        if (d->is_drm && strcmp(namebuf, "rknpu") != 0) {
+        if (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) != 0) {
+            close(fd);
+            return refuse_misc_node(forced, 1);
+        }
+        if (strcmp(namebuf, "rknpu") != 0) {
             RKNPU_LOGE("%s is DRM driver '%s', expected 'rknpu'\n", forced, namebuf);
             close(fd);
             return -ENODEV;
@@ -425,7 +449,7 @@ static int open_node(struct rknpu_dev *d)
         memset(&v, 0, sizeof v); memset(namebuf, 0, sizeof namebuf);
         v.name_len = sizeof namebuf - 1; v.name = namebuf;
         if (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) == 0 && strcmp(namebuf, "rknpu") == 0) {
-            d->fd = fd; d->is_drm = 1;
+            d->fd = fd;
             return 0;
         }
         seen[nseen].minor = n; seen[nseen].err = 0;
@@ -434,7 +458,7 @@ static int open_node(struct rknpu_dev *d)
         close(fd);
     }
     int fd = open("/dev/rknpu", O_RDWR | O_CLOEXEC);
-    if (fd >= 0) { d->fd = fd; d->is_drm = 0; return 0; }
+    if (fd >= 0) { close(fd); return refuse_misc_node("/dev/rknpu", 0); }
     int misc_err = errno;
     if (misc_err == EACCES || misc_err == EPERM) ndenied++;
 
@@ -458,25 +482,36 @@ static int open_node(struct rknpu_dev *d)
                    "owns /dev/dri/renderD* (usually `render`).\n", ndenied);
     else
         RKNPU_LOGE("Every node above was readable and none is 'rknpu'. Check that the "
-                   "driver bound: `sudo dmesg | grep -i rknpu` prints \"Initialized "
-                   "rknpu\" when it did, and `ls -l /sys/class/drm/renderD*/device/driver` "
+                   "driver bound: `sudo journalctl -b -k | grep -i \"Initialized rknpu\"` "
+                   "prints a line when it did, and `ls -l /sys/class/drm/renderD*/device/driver` "
                    "names the driver behind each node. ROCKET_DEV=<path> forces one.\n");
     return -ENODEV;
+}
+
+/* The library opens one fd per worker, so a note made at open would repeat once per
+ * worker on every multi-threaded call. Each note below prints once per process. */
+static int note_once(_Atomic int *flag)
+{
+    return atomic_exchange(flag, 1) == 0;
 }
 
 /* The driver's own version, read before anything depends on a structure layout.
  * `rknpu_action` is 8 bytes in every released version, so this call is answered even by
  * a driver whose memory structures this provider cannot speak. 0 means the read failed,
- * which is treated as "assume current": a working board keeps working, and the
- * MEM_CREATE failure below still names the floor. */
+ * which is treated as "assume current": a working board keeps working, a 0.9.6 driver
+ * ignores the RKNPU_IOVA_TIGHT bit it would then be handed, and the MEM_CREATE failure
+ * below still names the floor on an older one. */
 static uint32_t read_drv_version(const struct rknpu_dev *d)
 {
+    static _Atomic int noted;
     struct rknpu_action a;
     memset(&a, 0, sizeof a);
     a.flags = RKNPU_GET_DRV_VERSION;
-    if (ioctl(d->fd, ioc(d, RKNPU_ACTION_NR, sizeof a), &a) < 0) {
-        RKNPU_LOGE("GET_DRV_VERSION: %s; proceeding as if the driver were current\n",
-                   strerror(errno));
+    if (ioctl(d->fd, ioc(RKNPU_ACTION_NR, sizeof a), &a) < 0) {
+        int e = errno;
+        if (note_once(&noted))
+            RKNPU_LOGE("GET_DRV_VERSION: %s; proceeding as if the driver were current\n",
+                       strerror(e));
         return 0;
     }
     return a.value;
@@ -484,11 +519,13 @@ static uint32_t read_drv_version(const struct rknpu_dev *d)
 
 static void version_notes(uint32_t v)
 {
+    static _Atomic int noted;
     if (!v || v >= RKNPU_DRV_VERSION_IOVA_TIGHT) return;
+    if (!note_once(&noted)) return;
     RKNPU_LOGE("rknpu %u.%u.%u predates RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT (0.9.7), "
                "so RKNPU_IOVA_TIGHT is unavailable and every buffer takes the kernel's "
-               "generic IOVA path. That path permanently consumes the shared IOMMU "
-               "domain, and only a reboot returns it.\n",
+               "generic IOVA path. That path consumes the device's IOMMU domain beyond "
+               "the process; a reboot recovers it.\n",
                v / 10000, (v % 10000) / 100, v % 100);
 }
 
@@ -804,8 +841,8 @@ int rocket_no_dpu_done_supported(void) { return 0; }
  * SINGLE-CORE VALUES ONLY. A ganged mask (3/5/6/7) makes the driver commit the SAME
  * task range to each named core, so every core would run the whole program and write
  * the same output — that is the vendor runtime's multi-core-model split, which needs
- * a per-core task range this provider does not build. Anything else falls back to
- * core 0 rather than silently running the program twice. */
+ * a per-core task range this provider does not build. Any other value is logged and
+ * falls back to AUTO rather than silently running the program twice. */
 static uint32_t rknpu_core_mask_env(void)
 {
     static _Atomic int cached = -1;
@@ -904,7 +941,7 @@ static int submit_locked(struct rknpu_dev *d, const rocket_task_desc *tasks,
         s.subcore_task[c].task_number = n_prog;
     }
 
-    if (ioctl(d->fd, ioc(d, RKNPU_SUBMIT_NR, sizeof s), &s) < 0) {
+    if (ioctl(d->fd, ioc(RKNPU_SUBMIT_NR, sizeof s), &s) < 0) {
         int e = errno;
         RKNPU_LOGE("SUBMIT(%u programs, int_mask=0x%x): %s — dmesg carries the irq "
                    "status the handler saw against the required mask, and the hardware "
@@ -1059,7 +1096,7 @@ int rknpu_action(int fd, uint32_t action, uint32_t *value)
     memset(&a, 0, sizeof a);
     a.flags = action;
     a.value = *value;
-    if (ioctl(d->fd, ioc(d, RKNPU_ACTION_NR, sizeof a), &a) < 0)
+    if (ioctl(d->fd, ioc(RKNPU_ACTION_NR, sizeof a), &a) < 0)
         return -errno;
     *value = a.value;
     return 0;
