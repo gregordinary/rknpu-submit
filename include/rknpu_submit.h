@@ -13,18 +13,21 @@
  * compiled against providers that do not define them, and a caller that uses them does not
  * build against the mainline provider.
  *
- * The rknpu driver does not implement the DMA byte counters or the SRAM and NBUF pools on
- * the RK3588. Its rk3588_rknpu_config sets .amount_top = NULL, .amount_core = NULL and
+ * The rknpu driver does not implement the DMA byte counters or the NBUF pool on the
+ * RK3588. Its rk3588_rknpu_config sets .amount_top = NULL, .amount_core = NULL and
  * .nbuf_size = 0. A counter action therefore returns 0 and leaves *value as the caller
  * passed it. The driver logs "Get rw_amount is not supported on this device!", or "Get
- * total_rw_amount ..." for the total. Both SRAM queries return 0, and TRY_ALLOC_SRAM/_NBUF
- * fall back to DDR and grant sram_size = 0.
+ * total_rw_amount ..." for the total.
  *
  * Bandwidth QoS is not implemented there either: the three GET_BW_* actions return EINVAL
  * against .bw_priority_addr = 0x0. Other parts' configurations differ. The byte counters
  * are implemented on RK3576, rk356x, rk3562, rv1106 and rv1126b, the NBUF pool on RK3576,
- * rk3562 and rv1126b, and bandwidth QoS on rk356x. The SRAM pool comes from the device tree.
- * [HW sweep + source-confirmed]
+ * rk3562 and rv1126b, and bandwidth QoS on rk356x.
+ *
+ * The SRAM pool is not in the per-part configuration: the driver takes it from the device
+ * tree's rockchip,sram phandle on any part. On the RK3588 board measured, both SRAM queries
+ * return 0, and TRY_ALLOC_SRAM/_NBUF fall back to DDR and grant sram_size = 0.
+ * [HW sweep] [source-confirmed: BSP rknpu_drv.c, 0.9.8]
  *
  * On an RK3588, the measurements available are the hardware elapsed time per submit, the
  * clock and voltage queries, and the IOMMU domain id.
@@ -40,8 +43,8 @@ extern "C" {
 
 /* Hardware elapsed time of the last submit on this fd, in nanoseconds, as the driver
  * wrote it back into rknpu_submit.hw_elapse_time. It separates device time from dispatch
- * and host time without an external timer: measured 31-121 us across small and large
- * matmul shapes. Returns -1 for an fd this provider does not know.
+ * and host time without an external timer: measured 31-121 us on single matmul submits.
+ * Returns -1 for an fd this provider does not know.
  *
  * Not thread-safe. The value is per fd, not per submit: it is the last value written, so
  * read it immediately after the submit whose time you want. */
@@ -52,24 +55,30 @@ int64_t rknpu_last_hw_elapse_ns(int fd);
  * contributed. A tiled or multicore shape needs this sum. Each submit overwrites the per-fd
  * value above, so that value reports only the last kick of a many-kick matmul.
  *
- * The value is a ktime pair, not a hardware counter [source-confirmed, rknpu_job.c]. The
- * driver stamps hw_commit_time where it pulls the job off the core's todo list, immediately
- * before it writes the register program. It takes the delta in the IRQ path. The value
- * therefore includes the register-write burst and the interrupt latency. It excludes the
- * ioctl entry, the BO and IOMMU setup, the fence handling, and every host-side cost. The
- * packing and de-tiling that dominate this part's wall-clock time are host-side costs.
+ * The value is a ktime pair, not a hardware counter [source-confirmed: BSP rknpu_job.c,
+ * 0.9.8]. The driver stamps hw_commit_time where it pulls the job off the core's todo
+ * list, immediately before it writes the register program. It takes the delta in the IRQ
+ * path. The value therefore includes the register-write burst and the interrupt latency.
+ * It excludes the ioctl entry, the BO and IOMMU setup, the fence handling, and every
+ * host-side cost. The packing and de-tiling that dominate this part's wall-clock time are
+ * host-side costs.
  *
  * Read these bounds before quoting a dispatch overhead from the difference between this sum
  * and wall-clock time.
  *
- * Two more bounds, neither visible from the value:
+ * Three more bounds, none visible from the value:
+ *
+ * The sum is process-wide. Where several worker fds submit at once, it adds their device
+ * times, which can exceed the wall-clock time they overlap in. Run one worker to compare
+ * the sum with wall-clock time.
  *
  * On a multicore job, each core's completion overwrites the job's elapsed time rather than
  * adding to it. A three-core submit therefore contributes one core's span, not their sum.
  *
  * The driver commits a job with more than max_submit_number tasks (4095 on RK3588) in
- * chunks, without re-stamping hw_commit_time. Such a job's contribution spans every chunk
- * from the first commit. The task counts this library emits stay below that limit.
+ * chunks, and rknpu_job_done() commits each next chunk without re-stamping hw_commit_time.
+ * Such a job's contribution spans every chunk from the first commit. The task counts this
+ * library emits stay below that limit.
  *
  * Submits the driver never committed write back 0 and are counted in neither sum. */
 uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits);
@@ -77,8 +86,9 @@ uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits);
 /* Raw DRM_IOCTL_RKNPU_ACTION. `action` is one of the rknpu uAPI's RKNPU_GET_ / RKNPU_SET_
  * numbers. The provider's src/rknpu_uapi.h transcribes them and is not installed. *value
  * is the input for a SET and receives the result for a GET.
- * Returns 0, or a negative errno. The driver returns EINVAL for an action this part does
- * not implement. That EINVAL is an answer about the part, not a failure of this call.
+ * Returns 0, or a negative errno. It returns -EBADF for an fd this provider did not open,
+ * and -EINVAL for a null `value`. The driver's -EINVAL means this part does not implement
+ * the action.
  *
  * The counter actions wrap at 4 GB of traffic (rknpu_action.value is __u32). Clear them
  * with RKNPU_ACT_CLR_TOTAL_RW_AMOUNT before each measurement, rather than differencing two

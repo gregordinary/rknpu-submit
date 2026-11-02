@@ -981,8 +981,8 @@ static int submit_tasks(int fd, const rocket_task_desc *tasks, uint32_t n_tasks,
     /* UNCHAINED: n independent programs at n unrelated addresses, which this uAPI
      * cannot express in one job — only the first program's address is ever
      * programmed. So they go one per submit. Correct (this is the single-task shape
-     * M2 measured bit-exact), and explicitly n ioctls rather than 1: the submit
-     * counters are what tell the two apart. */
+     * measured bit-exact against the host reference), and explicitly n ioctls rather
+     * than 1: the submit counters are what tell the two apart. */
     for (uint32_t i = 0; i < n_tasks; i++) {
         int rc = submit_kick(d, &tasks[i], 1, int_mask, timeout_ms);
         if (rc < 0) return rc;
@@ -1092,7 +1092,10 @@ int rknpu_action(int fd, uint32_t action, uint32_t *value)
 {
     struct rknpu_dev *d = dev_find(fd);
     struct rknpu_action a;
-    if (!d || !value) return -EINVAL;
+    /* -EBADF, as every other entry point answers an unknown fd: the driver's own EINVAL means
+     * "this part does not implement the action", and a caller probing the part reads it so. */
+    if (!d) return -EBADF;
+    if (!value) return -EINVAL;
     memset(&a, 0, sizeof a);
     a.flags = action;
     a.value = *value;

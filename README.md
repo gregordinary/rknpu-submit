@@ -39,8 +39,7 @@ Validated on the RK3588 with 0.9.8 (see [Validation](#validation)). The driver's
 0.9.6 on 2024-03-18, 0.9.7 on 2024-04-24 and 0.9.8 on 2024-08-28. 0.9.8 was the newest release
 when this was validated.
 
-The driver versions independently of the kernel it ships in, and the provider reads the version
-at open:
+The provider reads the driver's version at open:
 
 - **Below 0.9.6.** The memory allocation interface changed in 0.9.6, and this provider speaks
   only the later form, so every allocation would fail. The provider refuses at open with one
@@ -241,10 +240,9 @@ Confirm it:
 sudo journalctl -b -k | grep -i iova
 ```
 
-A reboot resets the window. The same shape generally passes with more workers, which splits the
-buffer into pieces the window can still serve. Keep `RKNPU_IOVA_TIGHT`
-at its default of `1`, which stops a workload from consuming window space permanently
-([`RKNPU_IOVA_TIGHT`](#rknpu_iova_tight) has the detail).
+A refusal logs `RKNPU: failed to allocate IOVA: -12`. A reboot resets the window. Keep
+`RKNPU_IOVA_TIGHT` at its default of `1`, which stops a workload from consuming window space
+permanently ([`RKNPU_IOVA_TIGHT`](#rknpu_iova_tight) has the detail).
 
 <details>
 <summary>How fast the window fragments</summary>
@@ -308,8 +306,8 @@ cmake -S ggml-rocket -B build-ggml-rocket \
 cmake --build build-ggml-rocket -j
 ```
 
-`HOST_DIR` and `GGML_LIB_DIR` point at the host application's own bundled `ggml`, and the backend
-must be built against it. A `.so` built against a different `ggml` checkout registers no device.
+`HOST_DIR` and `GGML_LIB_DIR` name that bundled `ggml`. A `.so` built against a different `ggml`
+checkout registers no device.
 The host's loader refuses a different `GGML_BACKEND_API_VERSION`, and the backend refuses a host
 whose op numbering moved.
 
@@ -361,7 +359,8 @@ ROCKET profile total(ms): pack=<ms> (packA=<ms> packB=<ms>) gen=<ms> sync=<ms> s
 With the encoder on the NPU, whisper.cpp uses fewer CPU core-seconds, and the saving is larger
 than the wall-clock speedup. The process blocks on the NPU with its threads idle, so the CPU time
 freed exceeds the wall-clock time saved. On a 30 s clip, `base.en` runs 1.10x faster in
-wall-clock time and uses 17.4% fewer CPU core-seconds. A wall-clock ratio quoted as a CPU saving
+wall-clock time than the CPU-only run and uses 17.4% fewer CPU core-seconds. A wall-clock ratio
+quoted as a CPU saving
 is wrong in either direction, depending on the clip.
 
 Two measurements follow, and they answer different questions. In the first, each clip runs in
@@ -397,13 +396,18 @@ transmission incurs it every time and loses much of the saving, so keep the mode
 (`taskset -c 4-7`), CPU governor `performance`, `ROCKET_KACC=1`, warm.
 
 **Not characterized:** the NPU's physical clock. Above 200 MHz it follows the rail voltage, which
-the `rknpu` driver sets per operating point.
+the `rknpu` driver sets per operating point. Also the driver's default 1000 MHz operating point,
+which a stock board runs and these figures did not.
 
 > [!NOTE]
 > Discard the warm-up run of a measurement: a cold run measures about 15% low. On a stock BSP
 > board, DDR also runs under `dmc_ondemand`, which slows a CPU-only run and not an NPU one. Pin
-> `/sys/class/devfreq/dmc` to `performance`, as well as the CPU governor, before comparing the
-> two.
+> the DDR and the CPU governors before comparing the two:
+>
+> ```sh
+> echo performance | sudo tee /sys/class/devfreq/dmc/governor
+> echo performance | sudo tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor
+> ```
 
 #### Evidence
 
@@ -413,9 +417,9 @@ backend.
 
 ### Agreement with the CPU
 
-The NPU encoder computes in fp16 where the CPU's computes in fp32, so the two transcripts are
-close rather than bit-identical. Whether a difference reaches the transcript depends on the
-audio. Both configurations are deterministic, and every repetition within one is byte-identical,
+The NPU and the CPU round the encoder's arithmetic differently, so the two transcripts are close
+rather than identical. The audio decides whether a difference reaches the transcript. Both
+configurations are deterministic, and every repetition within one is byte-identical,
 so a difference between them comes from the arithmetic and not from a race.
 
 On clean read speech the transcripts are identical, for all three models at every length tested.
@@ -459,10 +463,12 @@ Four settings decide the cost, and each is a rule rather than a tuned number:
   of 1500, the whole window. Set to the chunk length itself, `-ac` halves the
   encode and breaks the decoder. Every chunk transcribes correctly to the audio's end and then runs
   on into a loop. The model never sees the silence that closes an utterance.
-- **`-nt` (no timestamps).** It saves 12% of the CPU core-seconds at equal accuracy, and a 30 s
-  chunk requires it. With timestamps on, a chunk whose last timestamp falls short of the audio's
-  end has its remainder encoded again as a second window. A 30 s chunk is cut mid-word at the
-  window's edge, so that happens on most of them. Plain 30 s chunks therefore cost 13% more CPU
+- **`-nt` (no timestamps).** Averaged over three channel conditions (clean, 15 dB and 5 dB), it
+  saves 12% of the CPU core-seconds, and 4% on the 15 dB channel in the table below. Its WER is
+  better on both noisy channels and 0.6 points worse on clean speech. With timestamps on, a
+  chunk whose last timestamp falls short of the audio's end has its remainder encoded again as a
+  second window. A 30 s chunk is cut mid-word at the window's edge, so most of them re-encode,
+  and a 30 s chunk requires `-nt`. Over the three conditions, plain 30 s chunks cost 13% more CPU
   per second of audio than 20 s ones.
 - **`temperature_inc=0`, sent as a request field.** It turns off the temperature fallback. The
   fallback re-decodes a window the decoder is unsure of up to five more times, at about three
@@ -498,9 +504,9 @@ minimum:
 | NPU, `-nt`, `temperature_inc=0`, 30 s chunks | 0.74 | 5.8 s | 5.3 / 19.0 |
 | NPU, defaults, 30 s chunks | 1.21 | 9.6 s | 5.8 / 14.0 |
 
-The 20 s rows keep the latency and save 22-23% of the CPU core-seconds at the same or better
-accuracy. The 30 s row saves 26%, with the best clean-speech accuracy and a two- to five-point
-loss on the noisy channel, at 30 s of latency. Averaged over three channel conditions (clean,
+The two `-ac 1200` rows keep 20 s of latency and save 22-23% of the CPU core-seconds. The `-sns`
+row has the better WER on both sets. The 30 s row saves 26%, with the best clean-speech
+accuracy and a two- to five-point loss on the noisy channel, at 30 s of latency. Averaged over three channel conditions (clean,
 15 dB and 5 dB), the `-sns` row measures 0.70 and the 30 s row 0.65.
 
 Two changes do not help:
@@ -595,10 +601,10 @@ profile line as in step 8, which remains the only evidence that work reached the
 | NPU | 1.88 s | 9.00 |
 | CPU only | 2.97 s | 21.70 |
 
-The NPU run is 1.58x faster in wall-clock time and uses 58.5% fewer CPU core-seconds, with
-identical transcripts. Both runs use this CLI's default of every core, the Cortex-A55 cores
-included. Its core-second figures are therefore roughly twice `whisper-cli`'s at four threads,
-and the ratio is not comparable to the tables above.
+The NPU run is 1.58x faster in wall-clock time than the CPU-only run and uses 58.5% fewer CPU
+core-seconds, with identical transcripts. Both runs use this CLI's default of every core, the
+Cortex-A55 cores included. Its core-second figures are therefore roughly twice `whisper-cli`'s
+at four threads, so the ratio is not comparable to the tables above.
 
 **Conditions:** RK3588 (Turing RK1), `6.1.115-vendor-rk35xx`, the `rknpu` 0.9.8 driver through
 this provider, `whisper-base.en-Q8_0`, an 11 s clip, every CPU core.
@@ -628,9 +634,10 @@ cmake --build build-tflite-rocket -j
 `TFLITE_DIR` is a header root. The delegate is a classic C `TfLiteDelegate` and needs only
 `tensorflow/lite/core/c/{common,builtin_op_data}.h` plus `tensorflow/lite/builtin_ops.h`. The
 build also produces `libtflite_cshim.so`, which supplies the two TFLite C-API symbols the delegate
-binds at `dlopen`. The classic `tflite_runtime` and full `tensorflow` wheels export them. LiteRT
-(`ai_edge_litert`, the wheel on recent Python) keeps them internal, so under LiteRT, `LD_PRELOAD`
-the shim. Without it the delegate stops at `undefined symbol: TfLiteIntArrayCreate`.
+binds at `dlopen`. Under a Python interpreter, `LD_PRELOAD` the shim. LiteRT (`ai_edge_litert`)
+does not export the symbols, and `tflite_runtime` loads its copies `RTLD_LOCAL`, where the
+delegate cannot see them. Without it the delegate stops at `undefined symbol:
+TfLiteIntArrayCreate`.
 
 ```sh
 LD_PRELOAD=$PWD/build-tflite-rocket/libtflite_cshim.so python3 - <<'EOF'
@@ -666,19 +673,18 @@ their own.
 The delegate was built on 2026-08-26 from the same sources on both.
 
 **Not characterized:** the NPUs' physical clocks, which follow each kernel's rail voltage, so the
-latency comparison is not clock-matched. Also the delegate's current `native_int8` defaults, which
-requantize on chip through `rocket_conv2d_int8_q`, `rocket_conv2d_int8_q_perc` and the uint8 and
-per-axis depthwise entries, through this provider.
+latency comparison is not clock-matched. Also the routes that requantize on chip, which the
+delegate's `native_int8=1` takes by default, through this provider.
 
 ## Environment variables
 
 | Variable | Default | Effect |
 |---|---|---|
 | `ROCKET_DEV` | probe by driver name | Opens a specific node, for a board with more than one NPU or a test rig. |
-| `RKNPU_CORE_MASK` | `0` (the driver schedules cores) | Pins submits to one core: `1`, `2` or `4`. The provider logs any other value and lets the driver schedule. |
-| `ROCKET_BATCH_SUBMIT` | `1` (chained) | Read by `librocketnpu`, whose default on this provider is a [chained batch](#terms). `0` issues one submit per register program. |
-| `RKNPU_IOVA_TIGHT` | `1` | `0` maps buffers through the kernel's generic IOVA path, which consumes IOVA window space permanently. Requires `rknpu` 0.9.7. [`RKNPU_IOVA_TIGHT`](#rknpu_iova_tight) has the detail. |
-| `RKNPU_BO_SENTINEL` | `0` | Fills each new buffer with the given byte, so that an all-zero readback tells "the device wrote zeros" from "the device never wrote". |
+| `RKNPU_CORE_MASK` | `0` (the driver schedules cores) | Pins submits to one core: `1`, `2` or `4`, in decimal or `0x` hex. The provider logs any other value and lets the driver schedule. |
+| `ROCKET_BATCH_SUBMIT` | `1` (chained) | Read by `librocketnpu`, whose default on this provider is a [chained batch](#terms). `0`, or any value that does not parse as a positive integer (`on` included), issues one submit per register program. |
+| `RKNPU_IOVA_TIGHT` | `1` | `0` maps buffers through the kernel's generic IOVA path, which consumes IOVA window space permanently. The value parses as an integer, so `on` or `true` also turns it off. Requires `rknpu` 0.9.7, and [`RKNPU_IOVA_TIGHT`](#rknpu_iova_tight) has the detail. |
+| `RKNPU_BO_SENTINEL` | unset | Fills each new buffer with the given byte, in decimal or `0x` hex, so that an all-zero readback tells "the device wrote zeros" from "the device never wrote". Unset, buffers are filled with zeros while `RKNPU_IOVA_TIGHT` is on. |
 
 ### `RKNPU_IOVA_TIGHT`
 
@@ -750,9 +756,10 @@ uses the DPU pair (`0x300`). A pooling job ends on the PPU pair (`0xc00`), which
 `ROCKET_JOB_PPU_DONE` selects.
 
 > [!CAUTION]
-> A mask naming a block that finishes earlier retires the job at that point, before the program's
-> last stage has written its output. With a `0x3` mask at 64×256×256, hardware elapsed time falls
-> from 121 to 79 microseconds. Software must name the program's terminal stage.
+> A mask naming a block that finishes earlier retires the job when that block finishes, while
+> the program's last stage can still be running. With a `0x3` mask at 64×256×256, hardware
+> elapsed time falls from 121 to 79 microseconds. The output was still correct at that size. A
+> larger output is not characterized. Software must name the program's terminal stage.
 
 #### Evidence
 
@@ -769,16 +776,18 @@ and chained, none in 80 [HW sweep].
 | Core 0 pinned, unchained | 68-77 | 208-236 |
 | Core 0 pinned, chained | 36.8-39.3 | 409-437 |
 | Driver core scheduler, unchained | 47.5-48.3 | 333-339 |
-| Driver core scheduler, chained (the defaults) | 26.1-27.7 | 581-617 |
+| Driver core scheduler, chained (the provider's defaults) | 26.1-27.7 | 581-617 |
 | The same shape through the mainline `rocket` driver, for reference | 23.5-24.4 | 660-685 |
 
 **Conditions:** RK3588 (Turing RK1), the `rknpu` 0.9.8 driver at its 1000 MHz operating point,
-which the driver's `rknpu_ondemand` governor holds at idle.
+which the driver's `rknpu_ondemand` governor holds at idle. `librocketnpu`'s whole-tile matmul
+plan, which `ROCKET_MM_STREAM=0` selects. Measured 2026-08-23.
 
-**Not characterized:** the NPU clock of the mainline row.
+**Not characterized:** the NPU clock of the mainline row. Also `librocketnpu`'s default
+weight-streamed fp16 plan, through this provider.
 
-The two defaults combine. With the driver scheduling cores, `librocketnpu`'s fan-out across the
-three cores runs in parallel. The chained layout removes both the extra ioctls and the
+The provider's two defaults combine. With the driver scheduling cores, `librocketnpu`'s fan-out
+across the three cores runs in parallel. The chained layout removes both the extra ioctls and the
 operand-reuse restriction.
 
 #### Evidence
@@ -810,8 +819,9 @@ Query availability before planning a measurement. The driver configurations diff
 
 On the RK3588 the driver configuration leaves the counter registers unset and the NBUF size at
 zero. A counter query returns 0 and leaves the value as the caller passed it, and the driver logs
-`Get rw_amount is not supported on this device!` [source-confirmed: BSP `rknpu_drv.c`, 0.9.8]. Per-submit hardware elapsed time, the clock and voltage queries, and the IOMMU domain
-identifier are available there. The header states each function's bounds.
+`Get rw_amount is not supported on this device!` [source-confirmed: BSP `rknpu_drv.c`, 0.9.8].
+Per-submit hardware elapsed time, the clock and voltage queries, and the IOMMU domain identifier
+are available there. The header states each function's bounds.
 
 ## Validation
 
