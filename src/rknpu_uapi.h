@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rknpu-submit authors
 /*
  * rknpu_uapi.h — the part of the `rknpu` uAPI this provider uses, in the provider's own

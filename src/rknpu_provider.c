@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The rknpu-submit authors
 /*
  * rknpu_provider.c — librocketnpu's submit seam, implemented over the vendor `rknpu`
