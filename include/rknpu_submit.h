@@ -84,8 +84,8 @@ int64_t rknpu_last_hw_elapse_ns(int fd);
 uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits);
 
 /* Raw DRM_IOCTL_RKNPU_ACTION. `action` is one of the rknpu uAPI's RKNPU_GET_ / RKNPU_SET_
- * numbers. The provider's src/rknpu_uapi.h transcribes them and is not installed. *value
- * is the input for a SET and receives the result for a GET.
+ * numbers, as the driver's rknpu_ioctl.h defines them. The provider does not list them.
+ * *value is the input for a SET and receives the result for a GET.
  * Returns 0, or a negative errno. It returns -EBADF for an fd this provider did not open,
  * and -EINVAL for a null `value`. The driver's -EINVAL means this part does not implement
  * the action.

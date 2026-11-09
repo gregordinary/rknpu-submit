@@ -20,17 +20,17 @@
  * ---- Three places the two uAPIs genuinely differ ----------------------------
  *
  * 1. BOs are keyed on an OBJECT ADDRESS, not just a GEM handle. MEM_SYNC takes
- *    `obj_addr` (MEM_DESTROY keys on the handle on this DRM build), so rocket_bo
- *    carries the field (inert on the mainline provider, which leaves it 0).
+ *    `obj_cookie` (MEM_DESTROY keys on the handle on this DRM build), so rocket_bo
+ *    carries it as `obj_addr` (inert on the mainline provider, which leaves it 0).
  *
- * 2. The task array lives in DEVICE memory. rknpu_submit carries `task_obj_addr`, and
+ * 2. The task array lives in DEVICE memory. bsp_job carries `task_cookie`, and
  *    the driver reads the array through the object's KERNEL mapping — so the task BO
- *    must be created with RKNPU_MEM_KERNEL_MAPPING or the driver dereferences NULL.
+ *    must be created with BSP_ALLOC_KMAP or the driver dereferences NULL.
  *    That is a crash, not a refusal. The seam's `scratch` argument is host memory and
  *    cannot serve; this provider keeps its own per-fd task BO and grows it on demand,
  *    which is invisible through the unchanged signature.
  *
- * 3. SUBMIT BLOCKS. RKNPU_JOB_BLOCK is 0 and NONBLOCK is the flag, so this ioctl
+ * 3. SUBMIT BLOCKS. BSP_JOB_WAIT is 0 and not waiting is the flag, so this ioctl
  *    returns only once the job has retired. The mainline SUBMIT is asynchronous and
  *    the caller waits by PREP_BO'ing the output. Blocking is the STRONGER guarantee,
  *    so every caller written against the async contract is still correct here — a
@@ -91,10 +91,10 @@ struct rknpu_bo_priv { uint32_t handle; uint64_t obj_addr; uint64_t dma_addr; si
 
 struct rknpu_dev {
     int  fd;             /* -1 = free slot */
-    uint32_t drv_version;          /* RKNPU_GET_DRV_VERSION code, 0 if unreadable */
-    struct rknpu_bo_priv taskbo;   /* the rknpu_task[] array, grown on demand */
-    uint32_t taskbo_cap;           /* how many rknpu_task entries it holds     */
-    int64_t  last_hw_elapse_ns;    /* rknpu_submit.hw_elapse_time, written back */
+    uint32_t drv_version;          /* BSP_CTL_DRIVER_VERSION code, 0 if unreadable */
+    struct rknpu_bo_priv taskbo;   /* the bsp_task[] array, grown on demand */
+    uint32_t taskbo_cap;           /* how many bsp_task entries it holds     */
+    int64_t  last_hw_elapse_ns;    /* bsp_job.device_ns, written back */
     /* The task BO is per-DEVICE state that a submit rewrites in place, and the
      * mainline provider has no equivalent — there the kernel copies the task array
      * from a caller-owned pointer, so two threads on one fd never share a buffer.
@@ -141,8 +141,8 @@ static struct rknpu_dev *dev_find(int fd)
 /* The ioctl request word: 'd' + DRM_COMMAND_BASE, the DRM render node's encoding. */
 static unsigned long ioc(unsigned nr, size_t sz)
 {
-    return (unsigned long)_IOC(_IOC_READ | _IOC_WRITE, RKNPU_DRM_IOCTL_BASE,
-                               RKNPU_DRM_COMMAND_BASE + nr, sz);
+    return (unsigned long)_IOC(_IOC_READ | _IOC_WRITE, BSP_DRM_IOC_TYPE,
+                               BSP_DRM_DRIVER_BASE + nr, sz);
 }
 
 /* ============================================================================
@@ -186,7 +186,7 @@ void rocket_submit_counters_reset(void)
  * ==========================================================================*/
 
 /* RKNPU_IOVA_TIGHT=0 restores the kernel's generic IOVA mapping path (see
- * RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT in rknpu_uapi.h). ON by default, because the
+ * BSP_ALLOC_IOVA_TIGHT in rknpu_uapi.h). ON by default, because the
  * generic path LEAKS the shared IOMMU domain and this one does not.
  *
  * What it buys, llama.cpp pp2048 on Llama-3.2-3B F16 [HW sweep, rknpu 0.9.8, 2026-08-25]:
@@ -242,65 +242,65 @@ static uint32_t rknpu_iova_tight_flag(const struct rknpu_dev *d)
     if (v < 0) {
         const char *e = getenv("RKNPU_IOVA_TIGHT");
         v = (e && strtoul(e, NULL, 0) == 0) ? 0
-                                            : (int)RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;
+                                            : (int)BSP_ALLOC_IOVA_TIGHT;
         cached = v;
     }
     /* The bit arrived in 0.9.7. An older driver accepts it and ignores it, so setting
      * it there would read as protection the domain is not getting; rocket_open() has
      * already said so once. */
-    if (d && d->drv_version && d->drv_version < RKNPU_DRV_VERSION_IOVA_TIGHT) return 0;
+    if (d && d->drv_version && d->drv_version < BSP_VERSION_IOVA_TIGHT) return 0;
     return (uint32_t)v;
 }
 
 static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
                      struct rknpu_bo_priv *b)
 {
-    struct rknpu_mem_create c;
-    struct rknpu_mem_map m;
+    struct bsp_alloc c;
+    struct bsp_mmap_offset m;
     size_t mapped = page_up(want ? want : 1);
 
     memset(b, 0, sizeof *b);
     memset(&c, 0, sizeof c);
-    c.size  = mapped;
-    /* NON_CONTIGUOUS deliberately — see the note in rknpu_uapi.h. A contiguous
+    c.bytes = mapped;
+    /* BSP_ALLOC_SCATTER deliberately — see the note in rknpu_uapi.h. A contiguous
      * request becomes unmappable once CMA runs short, silently and only under load. */
-    c.flags = RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU |
-              RKNPU_MEM_ZEROING | rknpu_iova_tight_flag(d) | extra;
-    if (ioctl(d->fd, ioc(RKNPU_MEM_CREATE_NR, sizeof c), &c) < 0) {
+    c.flags = BSP_ALLOC_SCATTER | BSP_ALLOC_CACHED | BSP_ALLOC_VIA_IOMMU |
+              BSP_ALLOC_ZERO | rknpu_iova_tight_flag(d) | extra;
+    if (ioctl(d->fd, ioc(BSP_CMD_ALLOC, sizeof c), &c) < 0) {
         int e = errno;
         RKNPU_LOGE("MEM_CREATE(%zu): %s\n", mapped, strerror(e));
-        /* The request word carries sizeof(struct rknpu_mem_create), so a driver whose
-         * structure is the pre-0.9.6 40-byte one rejects the command itself. That is
-         * what ENOTTY means here, and it is the shape the failure takes when the version
-         * read at open returned nothing. */
+        /* The version read at open returned nothing, so the open-time floor never ran.
+         * ENOTTY is a command number the node does not know: not an rknpu driver, or a
+         * build without MEM_CREATE. A size mismatch alone does not fail here, because
+         * drm_ioctl() reconciles the two sizes (see rknpu_uapi.h). */
         if ((e == ENOTTY || e == EINVAL) && !d->drv_version)
-            RKNPU_LOGE("  the request word carries sizeof(rknpu_mem_create)=%zu, which "
-                       "rknpu 0.9.6 and later expect. A 0.9.5-or-older driver rejects "
-                       "it; this provider's floor is 0.9.6.\n", sizeof c);
+            RKNPU_LOGE("  the driver's version could not be read at open. This provider is "
+                       "validated on rknpu 0.9.6 and later, with `rknpu_mem_create` at "
+                       "%zu bytes.\n", sizeof c);
         return -e;
     }
     memset(&m, 0, sizeof m);
-    m.handle = c.handle;
-    if (ioctl(d->fd, ioc(RKNPU_MEM_MAP_NR, sizeof m), &m) < 0) {
+    m.gem_handle = c.gem_handle;
+    if (ioctl(d->fd, ioc(BSP_CMD_MMAP_OFFSET, sizeof m), &m) < 0) {
         int e = errno;
-        struct rknpu_mem_destroy z = { .handle = c.handle, .obj_addr = c.obj_addr };
-        RKNPU_LOGE("MEM_MAP(handle=%u): %s\n", c.handle, strerror(e));
-        ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z);
+        struct bsp_free z = { .gem_handle = c.gem_handle, .obj_cookie = c.obj_cookie };
+        RKNPU_LOGE("MEM_MAP(handle=%u): %s\n", c.gem_handle, strerror(e));
+        ioctl(d->fd, ioc(BSP_CMD_FREE, sizeof z), &z);
         return -e;
     }
-    void *p = mmap(NULL, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, (off_t)m.offset);
+    void *p = mmap(NULL, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, (off_t)m.mmap_offset);
     if (p == MAP_FAILED) {
         int e = errno;
-        struct rknpu_mem_destroy z = { .handle = c.handle, .obj_addr = c.obj_addr };
-        RKNPU_LOGE("mmap(handle=%u, %zu): %s\n", c.handle, mapped, strerror(e));
-        ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z);
+        struct bsp_free z = { .gem_handle = c.gem_handle, .obj_cookie = c.obj_cookie };
+        RKNPU_LOGE("mmap(handle=%u, %zu): %s\n", c.gem_handle, mapped, strerror(e));
+        ioctl(d->fd, ioc(BSP_CMD_FREE, sizeof z), &z);
         return -e;
     }
-    b->handle = c.handle; b->obj_addr = c.obj_addr; b->dma_addr = c.dma_addr;
+    b->handle = c.gem_handle; b->obj_addr = c.obj_cookie; b->dma_addr = c.iova;
     b->size = mapped; b->ptr = p;
 
-    /* On the LIMIT_IOVA_ALIGNMENT path a fresh BO is not usable as handed back:
-     * RKNPU_MEM_ZEROING's fill is not established from this mapping's point of
+    /* On the BSP_ALLOC_IOVA_TIGHT path a fresh BO is not usable as handed back:
+     * BSP_ALLOC_ZERO's fill is not established from this mapping's point of
      * view, and an op that relies on a zero-filled region reads back a surface
      * that never took the device's writes. Touching every page from the CPU and
      * flushing makes it usable. Measured: with it, conv2d_fp16_rocket and
@@ -316,12 +316,12 @@ static int bo_create(struct rknpu_dev *d, size_t want, uint32_t extra,
         int fill = e && *e ? (int)(strtoul(e, NULL, 0) & 0xff) : 0;
         if (e || rknpu_iova_tight_flag(d)) {
             memset(p, fill, mapped);
-            struct rknpu_mem_sync sy;
+            struct bsp_sync sy;
             memset(&sy, 0, sizeof sy);
-            sy.obj_addr = c.obj_addr; sy.offset = 0; sy.size = mapped;
-            sy.flags = RKNPU_MEM_SYNC_TO_DEVICE;
-            if (ioctl(d->fd, ioc(RKNPU_MEM_SYNC_NR, sizeof sy), &sy) < 0)
-                RKNPU_LOGE("BO prefill MEM_SYNC(handle=%u): %s\n", c.handle,
+            sy.obj_cookie = c.obj_cookie; sy.start = 0; sy.bytes = mapped;
+            sy.direction = BSP_SYNC_FOR_DEVICE;
+            if (ioctl(d->fd, ioc(BSP_CMD_SYNC, sizeof sy), &sy) < 0)
+                RKNPU_LOGE("BO prefill MEM_SYNC(handle=%u): %s\n", c.gem_handle,
                            strerror(errno));
         }
     }
@@ -336,8 +336,8 @@ static void bo_destroy(struct rknpu_dev *d, struct rknpu_bo_priv *b)
             RKNPU_LOGE("munmap(handle=%u, %zu): %s\n", b->handle, b->size, strerror(errno));
         b->ptr = NULL;
     }
-    struct rknpu_mem_destroy z = { .handle = b->handle, .obj_addr = b->obj_addr };
-    if (ioctl(d->fd, ioc(RKNPU_MEM_DESTROY_NR, sizeof z), &z) < 0)
+    struct bsp_free z = { .gem_handle = b->handle, .obj_cookie = b->obj_addr };
+    if (ioctl(d->fd, ioc(BSP_CMD_FREE, sizeof z), &z) < 0)
         RKNPU_LOGE("MEM_DESTROY(handle=%u): %s — leaking the object and its IOVA\n",
                    b->handle, strerror(errno));
     b->handle = 0;
@@ -346,10 +346,10 @@ static void bo_destroy(struct rknpu_dev *d, struct rknpu_bo_priv *b)
 static int bo_sync(struct rknpu_dev *d, uint64_t obj_addr, uint64_t off, uint64_t len,
                    uint32_t dir)
 {
-    struct rknpu_mem_sync s;
+    struct bsp_sync s;
     memset(&s, 0, sizeof s);
-    s.obj_addr = obj_addr; s.offset = off; s.size = len; s.flags = dir;
-    if (ioctl(d->fd, ioc(RKNPU_MEM_SYNC_NR, sizeof s), &s) < 0) {
+    s.obj_cookie = obj_addr; s.start = off; s.bytes = len; s.direction = dir;
+    if (ioctl(d->fd, ioc(BSP_CMD_SYNC, sizeof s), &s) < 0) {
         int e = errno;
         RKNPU_LOGE("MEM_SYNC(dir=0x%x, obj=0x%llx, %llu..%llu): %s\n", dir,
                    (unsigned long long)obj_addr, (unsigned long long)off,
@@ -405,11 +405,11 @@ static int open_node(struct rknpu_dev *d)
             RKNPU_LOGE("open(%s): %s\n", forced, strerror(e));
             return -e;
         }
-        struct rknpu_drm_version v;
+        struct bsp_node_version v;
         memset(&v, 0, sizeof v); memset(namebuf, 0, sizeof namebuf);
-        v.name_len = sizeof namebuf - 1; v.name = namebuf;
+        v.name_bytes = sizeof namebuf - 1; v.name = namebuf;
         /* A misc node answers no DRM VERSION; that is how the two are told apart. */
-        if (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) != 0) {
+        if (ioctl(fd, BSP_IOC_NODE_VERSION, &v) != 0) {
             close(fd);
             return refuse_misc_node(forced, 1);
         }
@@ -432,7 +432,7 @@ static int open_node(struct rknpu_dev *d)
 
     for (int n = RKNPU_RENDER_FIRST; n <= RKNPU_RENDER_LAST; n++) {
         char p[64];
-        struct rknpu_drm_version v;
+        struct bsp_node_version v;
         snprintf(p, sizeof p, "/dev/dri/renderD%d", n);
         int fd = open(p, O_RDWR | O_CLOEXEC);
         if (fd < 0) {
@@ -447,8 +447,8 @@ static int open_node(struct rknpu_dev *d)
             continue;
         }
         memset(&v, 0, sizeof v); memset(namebuf, 0, sizeof namebuf);
-        v.name_len = sizeof namebuf - 1; v.name = namebuf;
-        if (ioctl(fd, RKNPU_DRM_IOCTL_VERSION, &v) == 0 && strcmp(namebuf, "rknpu") == 0) {
+        v.name_bytes = sizeof namebuf - 1; v.name = namebuf;
+        if (ioctl(fd, BSP_IOC_NODE_VERSION, &v) == 0 && strcmp(namebuf, "rknpu") == 0) {
             d->fd = fd;
             return 0;
         }
@@ -496,7 +496,7 @@ static int note_once(_Atomic int *flag)
 }
 
 /* The driver's own version, read before anything depends on a structure layout.
- * `rknpu_action` is 8 bytes in every released version, so this call is answered even by
+ * `struct bsp_ctl` is 8 bytes in every released version, so this call is answered even by
  * a driver whose memory structures this provider cannot speak. 0 means the read failed,
  * which is treated as "assume current": a working board keeps working, a 0.9.6 driver
  * ignores the RKNPU_IOVA_TIGHT bit it would then be handed, and the MEM_CREATE failure
@@ -504,23 +504,23 @@ static int note_once(_Atomic int *flag)
 static uint32_t read_drv_version(const struct rknpu_dev *d)
 {
     static _Atomic int noted;
-    struct rknpu_action a;
+    struct bsp_ctl a;
     memset(&a, 0, sizeof a);
-    a.flags = RKNPU_GET_DRV_VERSION;
-    if (ioctl(d->fd, ioc(RKNPU_ACTION_NR, sizeof a), &a) < 0) {
+    a.op = BSP_CTL_DRIVER_VERSION;
+    if (ioctl(d->fd, ioc(BSP_CMD_CTL, sizeof a), &a) < 0) {
         int e = errno;
         if (note_once(&noted))
             RKNPU_LOGE("GET_DRV_VERSION: %s; proceeding as if the driver were current\n",
                        strerror(e));
         return 0;
     }
-    return a.value;
+    return a.data;
 }
 
 static void version_notes(uint32_t v)
 {
     static _Atomic int noted;
-    if (!v || v >= RKNPU_DRV_VERSION_IOVA_TIGHT) return;
+    if (!v || v >= BSP_VERSION_IOVA_TIGHT) return;
     if (!note_once(&noted)) return;
     RKNPU_LOGE("rknpu %u.%u.%u predates RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT (0.9.7), "
                "so RKNPU_IOVA_TIGHT is unavailable and every buffer takes the kernel's "
@@ -539,11 +539,11 @@ int rocket_open(void)
     if (rc < 0) return rc;
 
     tmp.drv_version = read_drv_version(&tmp);
-    if (tmp.drv_version && tmp.drv_version < RKNPU_DRV_VERSION_MIN) {
-        RKNPU_LOGE("rknpu %u.%u.%u is below this provider's floor of 0.9.6. Its "
-                   "`rknpu_mem_create` is 40 bytes where 0.9.6 and later make it 48, and "
-                   "the ioctl request word encodes that size, so buffer allocation would "
-                   "fail on every call. Refusing at open instead.\n",
+    if (tmp.drv_version && tmp.drv_version < BSP_VERSION_MIN) {
+        RKNPU_LOGE("rknpu %u.%u.%u is below this provider's floor of 0.9.6, the oldest "
+                   "driver it is validated on. 0.9.6 changed `rknpu_mem_create` and "
+                   "`rknpu_submit`, and this provider writes only the later forms. "
+                   "Refusing at open.\n",
                    tmp.drv_version / 10000, (tmp.drv_version % 10000) / 100,
                    tmp.drv_version % 100);
         close(tmp.fd);
@@ -672,7 +672,7 @@ int rocket_bo_prep(int fd, rocket_bo *bo, int dir, uint64_t timeout_ns)
     (void)dir; (void)timeout_ns;
     if (!d) return -EBADF;
     return bo_sync(d, bo->obj_addr, 0, page_up(bo->size ? bo->size : 1),
-                   RKNPU_MEM_SYNC_FROM_DEVICE);
+                   BSP_SYNC_FOR_CPU);
 }
 
 int rocket_bo_fini(int fd, rocket_bo *bo)
@@ -680,7 +680,7 @@ int rocket_bo_fini(int fd, rocket_bo *bo)
     struct rknpu_dev *d = dev_find(fd);
     if (!d) return -EBADF;
     return bo_sync(d, bo->obj_addr, 0, page_up(bo->size ? bo->size : 1),
-                   RKNPU_MEM_SYNC_TO_DEVICE);
+                   BSP_SYNC_FOR_DEVICE);
 }
 
 /* MEM_SYNC takes an offset and a size, so a range maps straight onto one ioctl. The
@@ -720,12 +720,12 @@ int rocket_bo_prep_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r, unsig
                           uint64_t timeout_ns)
 {
     (void)timeout_ns;   /* the submit already blocked; nothing left to wait for */
-    return sync_ranges(fd, bo, r, n, RKNPU_MEM_SYNC_FROM_DEVICE);
+    return sync_ranges(fd, bo, r, n, BSP_SYNC_FOR_CPU);
 }
 
 int rocket_bo_fini_ranges(int fd, rocket_bo *bo, const rocket_bo_range *r, unsigned n)
 {
-    return sync_ranges(fd, bo, r, n, RKNPU_MEM_SYNC_TO_DEVICE);
+    return sync_ranges(fd, bo, r, n, BSP_SYNC_FOR_DEVICE);
 }
 
 /* One ioctl per range, natively — unlike the mainline path, where a kernel older than
@@ -849,21 +849,21 @@ static uint32_t rknpu_core_mask_env(void)
     int v = cached;
     if (v < 0) {
         const char *e = getenv("RKNPU_CORE_MASK");
-        v = e ? (int)strtoul(e, NULL, 0) : (int)RKNPU_CORE_AUTO_MASK;
-        if (v != (int)RKNPU_CORE_AUTO_MASK && v != (int)RKNPU_CORE0_MASK &&
-            v != (int)RKNPU_CORE1_MASK && v != (int)RKNPU_CORE2_MASK) {
+        v = e ? (int)strtoul(e, NULL, 0) : (int)BSP_CORE_ANY;
+        if (v != (int)BSP_CORE_ANY && v != (int)BSP_CORE_BIT(0) &&
+            v != (int)BSP_CORE_BIT(1) && v != (int)BSP_CORE_BIT(2)) {
             RKNPU_LOGE("RKNPU_CORE_MASK=%s is not a single core (0 auto, 1/2/4); "
                        "using AUTO\n", e ? e : "");
-            v = (int)RKNPU_CORE_AUTO_MASK;
+            v = (int)BSP_CORE_ANY;
         }
         cached = v;
     }
     return (uint32_t)v;
 }
 
-/* Grow the per-fd task BO to hold at least `n` rknpu_task entries.
+/* Grow the per-fd task BO to hold at least `n` bsp_task entries.
  *
- * KERNEL_MAPPING is not optional: the driver reads the array through
+ * BSP_ALLOC_KMAP is not optional: the driver reads the array through
  * task_obj->kv_addr, which is populated only for that flag. Without it the pointer is
  * NULL and the driver dereferences it — a crash, not a refusal. */
 static int taskbo_ensure(struct rknpu_dev *d, uint32_t n)
@@ -872,10 +872,10 @@ static int taskbo_ensure(struct rknpu_dev *d, uint32_t n)
     bo_destroy(d, &d->taskbo);
     d->taskbo_cap = 0;
     uint32_t want = n < 64 ? 64 : n;
-    int rc = bo_create(d, (size_t)want * sizeof(struct rknpu_task),
-                       RKNPU_MEM_KERNEL_MAPPING, &d->taskbo);
+    int rc = bo_create(d, (size_t)want * sizeof(struct bsp_task),
+                       BSP_ALLOC_KMAP, &d->taskbo);
     if (rc < 0) return rc;
-    d->taskbo_cap = (uint32_t)(d->taskbo.size / sizeof(struct rknpu_task));
+    d->taskbo_cap = (uint32_t)(d->taskbo.size / sizeof(struct bsp_task));
     return 0;
 }
 
@@ -895,61 +895,61 @@ static int submit_locked(struct rknpu_dev *d, const rocket_task_desc *tasks,
     int rc = taskbo_ensure(d, n_prog);
     if (rc < 0) return rc;
 
-    struct rknpu_task *t = d->taskbo.ptr;
+    struct bsp_task *t = d->taskbo.ptr;
     for (uint32_t i = 0; i < n_prog; i++) {
-        /* regcfg_amount is regcmd_count minus the 4-op control trailer this uAPI adds
+        /* body_ops is regcmd_count minus the 4-op control trailer this uAPI adds
          * back itself. A count below that trailer is not a program. */
-        if (tasks[i].regcmd_count <= RKNPU_REGCFG_EXTRA) {
+        if (tasks[i].regcmd_count <= BSP_TRAILER_OPS) {
             RKNPU_LOGE("task %u/%u: regcmd_count=%u does not even cover the %u-op "
                        "control trailer\n", i, n_prog, tasks[i].regcmd_count,
-                       RKNPU_REGCFG_EXTRA);
+                       BSP_TRAILER_OPS);
             return -EINVAL;
         }
         memset(&t[i], 0, sizeof t[i]);
-        t[i].int_mask      = int_mask;
-        t[i].regcfg_amount = tasks[i].regcmd_count - RKNPU_REGCFG_EXTRA;
-        t[i].regcmd_addr   = tasks[i].regcmd;
-        /* enable_mask / int_clear / op_idx / regcfg_offset are never read by the
-         * driver; int_status is written BACK. All left zero by the memset. */
+        t[i].irq_wait     = int_mask;
+        t[i].body_ops     = tasks[i].regcmd_count - BSP_TRAILER_OPS;
+        t[i].program_iova = tasks[i].regcmd;
+        /* unused_enable / unused_clear / op_index / unused_offset are never read by
+         * the driver; irq_status is written BACK. All left zero by the memset. */
     }
     rc = bo_sync(d, d->taskbo.obj_addr, 0,
-                 (uint64_t)n_prog * sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE);
+                 (uint64_t)n_prog * sizeof(struct bsp_task), BSP_SYNC_FOR_DEVICE);
     if (rc < 0) return rc;
 
-    struct rknpu_submit s;
+    struct bsp_job s;
     memset(&s, 0, sizeof s);
-    s.flags           = RKNPU_JOB_PC | RKNPU_JOB_BLOCK;
-    s.timeout         = timeout_ms ? timeout_ms : 2000;
-    s.task_start      = 0;
-    s.task_number     = n_prog;
-    s.priority        = 0;
-    s.task_obj_addr   = d->taskbo.obj_addr;   /* the kernel object, not the handle */
-    s.iommu_domain_id = 0;
+    s.mode        = BSP_JOB_VIA_PC | BSP_JOB_WAIT;
+    s.timeout_ms  = timeout_ms ? timeout_ms : 2000;
+    s.first_task  = 0;
+    s.task_count  = n_prog;
+    s.priority    = 0;
+    s.task_cookie = d->taskbo.obj_addr;   /* the kernel object, not the handle */
+    s.domain      = 0;
     /* PC_DMA_BASE_ADDR. Mainline rocket writes 0 here and programs the full IOVA into
-     * PC_BASE_ADDRESS, which is exactly what regcmd_addr already is, so 0 is the
+     * PC_BASE_ADDRESS, which is exactly what program_iova already is, so 0 is the
      * equivalence-preserving choice and is what was measured working. hello2.c sets
      * this to the regcmd address instead; that file is an RE scratch pad with no
      * evidence it ever completed. */
-    s.task_base_addr  = 0;
-    s.core_mask       = rknpu_core_mask_env();
-    s.fence_fd        = -1;
+    s.pc_dma_base = 0;
+    s.cores       = rknpu_core_mask_env();
+    s.fence       = -1;
     /* Every entry, not just [0]: with the AUTO mask the driver picks the core and
-     * then reads subcore_task[core_index], so a job that lands on core 1 or 2 would
-     * otherwise find task_number = 0 and never complete. Harmless for a fixed mask. */
+     * then reads per_core[core_index], so a job that lands on core 1 or 2 would
+     * otherwise find count = 0 and never complete. Harmless for a fixed mask. */
     for (int c = 0; c < 3; c++) {
-        s.subcore_task[c].task_start  = 0;
-        s.subcore_task[c].task_number = n_prog;
+        s.per_core[c].first = 0;
+        s.per_core[c].count = n_prog;
     }
 
-    if (ioctl(d->fd, ioc(RKNPU_SUBMIT_NR, sizeof s), &s) < 0) {
+    if (ioctl(d->fd, ioc(BSP_CMD_SUBMIT, sizeof s), &s) < 0) {
         int e = errno;
         RKNPU_LOGE("SUBMIT(%u programs, int_mask=0x%x): %s — dmesg carries the irq "
                    "status the handler saw against the required mask, and the hardware "
                    "task counter it stopped at\n", n_prog, int_mask, strerror(e));
         return -e;
     }
-    d->last_hw_elapse_ns = s.hw_elapse_time;
-    count_submit(n_prog, s.hw_elapse_time);
+    d->last_hw_elapse_ns = s.device_ns;
+    count_submit(n_prog, s.device_ns);
     return 0;
 }
 
@@ -971,8 +971,8 @@ static int submit_tasks(int fd, const rocket_task_desc *tasks, uint32_t n_tasks,
 
     /* Which block the job's last program completes on. The driver takes INT_MASK from
      * the last task, so this is per-job by construction here. */
-    uint32_t int_mask = (job_flags & ROCKET_JOB_PPU_DONE) ? RKNPU_TASK_INT_MASK_PPU
-                                                          : RKNPU_TASK_INT_MASK_DPU;
+    uint32_t int_mask = (job_flags & ROCKET_JOB_PPU_DONE) ? BSP_IRQ_PPU_PAIR
+                                                          : BSP_IRQ_DPU_PAIR;
 
     /* CHAINED: one kick, the hardware's task counter walks the stream. */
     if (job_flags & ROCKET_JOB_BATCHED)
@@ -1059,7 +1059,7 @@ int rocket_submit_matmul(int fd, const rocket_bo *regcmd_bo, uint32_t regcmd_cou
 int rocket_submit_jobs(int fd, const rocket_job_desc *jobs, uint32_t n_jobs)
 {
     /* Mainline puts N jobs in ONE ioctl so the kernel can spread them across cores.
-     * This uAPI's multicore control is core_mask plus a per-core subcore_task[] range
+     * This uAPI's multicore control is `cores` plus a per-core `per_core[]` range
      * WITHIN one job, which is a different shape, and a blocking submit forecloses the
      * overlap anyway. So this runs them in order: correct, and explicitly not
      * concurrent. The submit counters tell the two apart — N ioctls here against the
@@ -1091,16 +1091,16 @@ uint64_t rknpu_hw_elapse_total_ns(uint64_t *n_submits)
 int rknpu_action(int fd, uint32_t action, uint32_t *value)
 {
     struct rknpu_dev *d = dev_find(fd);
-    struct rknpu_action a;
+    struct bsp_ctl a;
     /* -EBADF, as every other entry point answers an unknown fd: the driver's own EINVAL means
      * "this part does not implement the action", and a caller probing the part reads it so. */
     if (!d) return -EBADF;
     if (!value) return -EINVAL;
     memset(&a, 0, sizeof a);
-    a.flags = action;
-    a.value = *value;
-    if (ioctl(d->fd, ioc(RKNPU_ACTION_NR, sizeof a), &a) < 0)
+    a.op   = action;
+    a.data = *value;
+    if (ioctl(d->fd, ioc(BSP_CMD_CTL, sizeof a), &a) < 0)
         return -errno;
-    *value = a.value;
+    *value = a.data;
     return 0;
 }

@@ -41,9 +41,12 @@ when this was validated.
 
 The provider reads the driver's version at open:
 
-- **Below 0.9.6.** The memory allocation interface changed in 0.9.6, and this provider speaks
-  only the later form, so every allocation would fail. The provider refuses at open with one
-  message instead.
+- **Below 0.9.6.** 0.9.6 lengthened `rknpu_mem_create` and re-purposed a field of
+  `rknpu_submit`, and this provider writes only the later forms. The longer allocation structure
+  does not by itself fail on the DRM render node. Its ioctl dispatch matches a command by number
+  and hands an older driver the prefix it knows. What an older driver does with the
+  re-purposed submit field is not established, and no driver below 0.9.6 has run the provider.
+  The provider refuses at open with one message.
 - **0.9.6.** The flag `RKNPU_IOVA_TIGHT` sets arrived in 0.9.7, and an older driver accepts it
   and ignores it. The provider withholds it, and buffers take the generic mapping path described
   under [`RKNPU_IOVA_TIGHT`](#rknpu_iova_tight).
