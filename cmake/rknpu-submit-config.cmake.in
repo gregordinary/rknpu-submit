@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The rknpu-submit authors
 @PACKAGE_INIT@
 
 # rknpu-submit exposes Threads::Threads through its public interface (the provider's
